@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""claude-toggle — enable/disable local MCP servers and snapshot Claude Code config.
+
+MCP servers live in ~/.claude.json (global `mcpServers` and per-project
+`projects.<path>.mcpServers`). Disabling a server moves its config into
+~/.claude/mcp-disabled.json so it can be restored losslessly; enabling
+moves it back. Every mutation first writes a timestamped backup of
+~/.claude.json into ~/.claude/backups/.
+
+Usage:
+  claude-toggle list
+  claude-toggle disable <server> [--project <path>|--global]
+  claude-toggle enable  <server> [--project <path>|--global]
+  claude-toggle profile save <name>     # snapshot .claude.json mcp config + settings.json
+  claude-toggle profile load <name>
+  claude-toggle profile list
+
+If neither --project nor --global is given, disable/enable acts on every
+scope where the server is found (or stashed).
+"""
+
+import json
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CLAUDE_JSON = HOME / ".claude.json"
+SETTINGS_JSON = HOME / ".claude" / "settings.json"
+STASH = HOME / ".claude" / "mcp-disabled.json"
+BACKUPS = HOME / ".claude" / "backups"
+PROFILES = HOME / ".claude" / "config-profiles"
+
+GLOBAL = "__global__"
+
+
+def load(path, default):
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return default
+
+
+def save(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(path)
+
+
+def backup_claude_json():
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = BACKUPS / f"claude.json.{stamp}"
+    shutil.copy2(CLAUDE_JSON, dest)
+    return dest
+
+
+def scopes(cfg):
+    """Yield (scope_key, mcpServers dict) for global + each project.
+
+    Read-only view: never inserts keys into cfg. Mutations pop from the
+    returned dict, which is the live dict when it exists in cfg.
+    """
+    yield GLOBAL, cfg.get("mcpServers", {})
+    for proj, pcfg in cfg.get("projects", {}).items():
+        yield proj, pcfg.get("mcpServers", {})
+
+
+def scope_label(key):
+    return "global" if key == GLOBAL else key
+
+
+def cmd_list():
+    cfg = load(CLAUDE_JSON, {})
+    stash = load(STASH, {})
+    rows = []
+    for key, servers in scopes(cfg):
+        for name, sc in servers.items():
+            rows.append((scope_label(key), name, "enabled", sc.get("type", "stdio")))
+    for key, servers in stash.items():
+        for name, sc in servers.items():
+            rows.append((scope_label(key), name, "DISABLED", sc.get("type", "stdio")))
+    if not rows:
+        print("No MCP servers configured.")
+        return
+    w = max(len(r[0]) for r in rows)
+    print(f"{'SCOPE'.ljust(w)}  {'SERVER'.ljust(16)}  {'STATUS'.ljust(9)}  TYPE")
+    for scope, name, status, typ in sorted(rows):
+        print(f"{scope.ljust(w)}  {name.ljust(16)}  {status.ljust(9)}  {typ}")
+
+
+def pick_scopes(arg_scope):
+    """Return a filter function over scope keys based on CLI args."""
+    if arg_scope == GLOBAL:
+        return lambda k: k == GLOBAL
+    if arg_scope:
+        return lambda k: k == arg_scope
+    return lambda k: True
+
+
+def cmd_disable(server, arg_scope):
+    cfg = load(CLAUDE_JSON, {})
+    stash = load(STASH, {})
+    wanted = pick_scopes(arg_scope)
+    moved = []
+    for key, servers in scopes(cfg):
+        if wanted(key) and server in servers:
+            stash.setdefault(key, {})[server] = servers.pop(server)
+            moved.append(key)
+    if not moved:
+        sys.exit(f"'{server}' not found enabled in the requested scope(s). Run 'claude-toggle list'.")
+    print(f"backup: {backup_claude_json()}")
+    save(STASH, stash)
+    save(CLAUDE_JSON, cfg)
+    for key in moved:
+        print(f"disabled '{server}' in {scope_label(key)}")
+    print("Takes effect in new Claude Code sessions. Avoid toggling while closing a live session (it rewrites ~/.claude.json on exit).")
+
+
+def cmd_enable(server, arg_scope):
+    cfg = load(CLAUDE_JSON, {})
+    stash = load(STASH, {})
+    wanted = pick_scopes(arg_scope)
+    moved = []
+    for key in list(stash.keys()):
+        if wanted(key) and server in stash[key]:
+            sc = stash[key].pop(server)
+            if not stash[key]:
+                del stash[key]
+            if key == GLOBAL:
+                cfg.setdefault("mcpServers", {})[server] = sc
+            else:
+                cfg.setdefault("projects", {}).setdefault(key, {}).setdefault("mcpServers", {})[server] = sc
+            moved.append(key)
+    if not moved:
+        sys.exit(f"'{server}' not found in the disabled stash. Run 'claude-toggle list'.")
+    print(f"backup: {backup_claude_json()}")
+    save(STASH, stash)
+    save(CLAUDE_JSON, cfg)
+    for key in moved:
+        print(f"enabled '{server}' in {scope_label(key)}")
+    print("Takes effect in new Claude Code sessions.")
+
+
+def mcp_snapshot(cfg):
+    """Extract just the MCP-related parts of .claude.json."""
+    snap = {"mcpServers": cfg.get("mcpServers", {}), "projects": {}}
+    for proj, pcfg in cfg.get("projects", {}).items():
+        if pcfg.get("mcpServers"):
+            snap["projects"][proj] = {"mcpServers": pcfg["mcpServers"]}
+    return snap
+
+
+def cmd_profile(action, name=None):
+    PROFILES.mkdir(parents=True, exist_ok=True)
+    if action == "list":
+        found = sorted(PROFILES.glob("*.json"))
+        if not found:
+            print("No saved profiles.")
+        for p in found:
+            print(p.stem)
+        return
+    if not name:
+        sys.exit("profile save/load needs a name")
+    pfile = PROFILES / f"{name}.json"
+    if action == "save":
+        cfg = load(CLAUDE_JSON, {})
+        save(pfile, {
+            "saved": datetime.now().isoformat(timespec="seconds"),
+            "mcp": mcp_snapshot(cfg),
+            "stash": load(STASH, {}),
+            "settings": load(SETTINGS_JSON, {}),
+        })
+        print(f"saved profile '{name}' -> {pfile}")
+    elif action == "load":
+        if not pfile.exists():
+            sys.exit(f"no profile named '{name}'")
+        prof = load(pfile, {})
+        cfg = load(CLAUDE_JSON, {})
+        print(f"backup: {backup_claude_json()}")
+        cfg["mcpServers"] = prof["mcp"].get("mcpServers", {})
+        for proj, pdata in prof["mcp"].get("projects", {}).items():
+            cfg.setdefault("projects", {}).setdefault(proj, {})["mcpServers"] = pdata["mcpServers"]
+        save(CLAUDE_JSON, cfg)
+        save(STASH, prof.get("stash", {}))
+        save(SETTINGS_JSON, prof.get("settings", {}))
+        print(f"loaded profile '{name}' (saved {prof.get('saved', '?')}). Restart Claude Code sessions to apply.")
+    else:
+        sys.exit("profile action must be save, load, or list")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = args[0]
+    if cmd == "list":
+        cmd_list()
+    elif cmd in ("disable", "enable"):
+        if len(args) < 2:
+            sys.exit(f"usage: claude-toggle {cmd} <server> [--project <path>|--global]")
+        server, scope = args[1], None
+        if "--global" in args:
+            scope = GLOBAL
+        elif "--project" in args:
+            i = args.index("--project")
+            if i + 1 >= len(args):
+                sys.exit("--project needs a path")
+            scope = str(Path(args[i + 1]).expanduser().resolve())
+        (cmd_disable if cmd == "disable" else cmd_enable)(server, scope)
+    elif cmd == "profile":
+        if len(args) < 2:
+            sys.exit("usage: claude-toggle profile save|load|list [name]")
+        cmd_profile(args[1], args[2] if len(args) > 2 else None)
+    else:
+        sys.exit(f"unknown command '{cmd}' — run 'claude-toggle help'")
+
+
+if __name__ == "__main__":
+    main()
