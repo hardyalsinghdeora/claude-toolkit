@@ -44,6 +44,36 @@ claude-toggle list                  # verify
 claude-toggle profile load full     # everything back on
 ```
 
+## claude-vault — private credentials & personal config
+
+Companion tool in this repo. Stores secrets (DB credentials, API keys, personal settings) in the **macOS Keychain** — encrypted by the OS, never in plaintext files, never in a git repo. Only names/descriptions are indexed locally (`~/.claude/vault-index.json`); values live solely in the Keychain.
+
+Built to use with AI sessions: Claude fetches a credential at the moment it needs it instead of the value sitting in prompts, memory, or config files.
+
+```bash
+claude-vault set asset-db --json --desc "MySQL for asset-logistic"
+#  paste: {"host":"...","port":"3306","user":"...","password":"...","database":"..."}
+claude-vault set jira-token --desc "Jira API token"
+
+claude-vault list                        # names + descriptions only, no values
+claude-vault get asset-db --field host   # one field of a JSON secret
+claude-vault get jira-token              # whole value
+claude-vault delete jira-token
+```
+
+Example — query a DB using stored credentials:
+
+```bash
+mysql -h "$(claude-vault get asset-db --field host)" \
+      -u "$(claude-vault get asset-db --field user)" \
+      -p"$(claude-vault get asset-db --field password)" \
+      "$(claude-vault get asset-db --field database)" -e "SELECT ..."
+```
+
+In a Claude Code session, just say e.g. *"search the asset DB for X — credentials are in claude-vault under `asset-db`"*.
+
+Install: same as claude-toggle (`cp claude-vault ~/.local/bin/`). macOS only.
+
 ## Notes
 
 - Changes take effect in **new** Claude Code sessions, not ones already running.

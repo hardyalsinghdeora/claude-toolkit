@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""claude-vault — private local store for credentials & personal config.
+
+Secrets (DB credentials, API keys, tokens, personal settings) are stored in
+the macOS Keychain — encrypted by the OS, never written to plaintext files,
+never inside any git repo. Only an index of names/descriptions (no secret
+values) is kept at ~/.claude/vault-index.json so entries can be listed.
+
+Made to pair with AI sessions: tell Claude "use claude-vault get <name>"
+and it can fetch a credential at the moment it needs it (e.g. to query a
+database) without the value living in prompts, memory files, or configs.
+
+Usage:
+  claude-vault set <name> [--desc "text"]     # prompts for the secret (hidden)
+  claude-vault set <name> --json              # prompts for a JSON blob, e.g.
+                                              #   {"host":"..","user":"..","password":".."}
+  claude-vault get <name>                     # print the secret value
+  claude-vault get <name> --field password    # print one field of a JSON secret
+  claude-vault list                           # names + descriptions only, no values
+  claude-vault delete <name>
+  claude-vault help
+
+Examples:
+  claude-vault set asset-db --json --desc "MySQL for asset-logistic"
+  claude-vault get asset-db --field host
+  mysql -h "$(claude-vault get asset-db --field host)" \\
+        -u "$(claude-vault get asset-db --field user)" \\
+        -p"$(claude-vault get asset-db --field password)"
+"""
+
+import getpass
+import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "1.0.0"
+SERVICE_PREFIX = "claude-vault."
+INDEX = Path.home() / ".claude" / "vault-index.json"
+ACCOUNT = getpass.getuser()
+
+
+def load_index():
+    if INDEX.exists():
+        with open(INDEX) as f:
+            return json.load(f)
+    return {}
+
+
+def save_index(idx):
+    INDEX.parent.mkdir(parents=True, exist_ok=True)
+    tmp = INDEX.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(idx, f, indent=2)
+    tmp.replace(INDEX)
+    INDEX.chmod(0o600)
+
+
+def keychain(args, **kw):
+    return subprocess.run(["security"] + args, capture_output=True, text=True, **kw)
+
+
+def kc_set(name, value):
+    r = keychain([
+        "add-generic-password", "-a", ACCOUNT, "-s", SERVICE_PREFIX + name,
+        "-w", value, "-U",
+        "-j", "stored by claude-vault",
+    ])
+    if r.returncode != 0:
+        sys.exit(f"keychain error: {r.stderr.strip()}")
+
+
+def kc_get(name):
+    r = keychain(["find-generic-password", "-a", ACCOUNT, "-s", SERVICE_PREFIX + name, "-w"])
+    if r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n")
+
+
+def kc_delete(name):
+    r = keychain(["delete-generic-password", "-a", ACCOUNT, "-s", SERVICE_PREFIX + name])
+    return r.returncode == 0
+
+
+def cmd_set(name, as_json, desc):
+    if as_json:
+        print("Paste the JSON value (one line), e.g. {\"host\":\"..\",\"user\":\"..\",\"password\":\"..\"}:",
+              file=sys.stderr)
+        raw = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("JSON value (hidden): ")
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as e:
+            sys.exit(f"not valid JSON: {e}")
+        value = raw
+    else:
+        value = sys.stdin.readline().rstrip("\n") if not sys.stdin.isatty() else getpass.getpass("Secret value (hidden): ")
+    if not value:
+        sys.exit("empty value — nothing stored")
+    kc_set(name, value)
+    idx = load_index()
+    idx[name] = {
+        "desc": desc or idx.get(name, {}).get("desc", ""),
+        "json": as_json,
+        "updated": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_index(idx)
+    print(f"stored '{name}' in macOS Keychain ({'JSON' if as_json else 'plain'} value, {len(value)} chars)")
+
+
+def cmd_get(name, field):
+    value = kc_get(name)
+    if value is None:
+        sys.exit(f"no secret named '{name}' — run 'claude-vault list'")
+    if field:
+        try:
+            data = json.loads(value)
+        except json.JSONDecodeError:
+            sys.exit(f"'{name}' is not a JSON secret — cannot extract field '{field}'")
+        if field not in data:
+            sys.exit(f"'{name}' has no field '{field}' (fields: {', '.join(data.keys())})")
+        value = data[field]
+        if not isinstance(value, str):
+            value = json.dumps(value)
+    print(value)
+
+
+def cmd_list():
+    idx = load_index()
+    if not idx:
+        print("Vault is empty. Add one with: claude-vault set <name>")
+        return
+    w = max(len(n) for n in idx)
+    print(f"{'NAME'.ljust(w)}  {'TYPE'.ljust(5)}  {'UPDATED'.ljust(19)}  DESCRIPTION")
+    for name, meta in sorted(idx.items()):
+        typ = "json" if meta.get("json") else "plain"
+        print(f"{name.ljust(w)}  {typ.ljust(5)}  {meta.get('updated', '?').ljust(19)}  {meta.get('desc', '')}")
+
+
+def cmd_delete(name):
+    existed = kc_delete(name)
+    idx = load_index()
+    in_index = name in idx
+    if in_index:
+        del idx[name]
+        save_index(idx)
+    if not existed and not in_index:
+        sys.exit(f"no secret named '{name}'")
+    print(f"deleted '{name}'")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = args[0]
+    if cmd in ("-v", "--version", "version"):
+        print(f"claude-vault {VERSION}")
+        return
+    if sys.platform != "darwin":
+        sys.exit("claude-vault uses the macOS Keychain and only runs on macOS")
+    if cmd == "set":
+        if len(args) < 2:
+            sys.exit("usage: claude-vault set <name> [--json] [--desc \"text\"]")
+        name = args[1]
+        as_json = "--json" in args
+        desc = ""
+        if "--desc" in args:
+            i = args.index("--desc")
+            if i + 1 >= len(args):
+                sys.exit("--desc needs a value")
+            desc = args[i + 1]
+        cmd_set(name, as_json, desc)
+    elif cmd == "get":
+        if len(args) < 2:
+            sys.exit("usage: claude-vault get <name> [--field <key>]")
+        field = None
+        if "--field" in args:
+            i = args.index("--field")
+            if i + 1 >= len(args):
+                sys.exit("--field needs a key")
+            field = args[i + 1]
+        cmd_get(args[1], field)
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "delete":
+        if len(args) < 2:
+            sys.exit("usage: claude-vault delete <name>")
+        cmd_delete(args[1])
+    else:
+        sys.exit(f"unknown command '{cmd}' — run 'claude-vault help'")
+
+
+if __name__ == "__main__":
+    main()
