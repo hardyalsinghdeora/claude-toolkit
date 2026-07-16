@@ -16,15 +16,21 @@ cp claude-toggle ~/.local/bin/     # or anywhere on your PATH
 ## Usage
 
 ```bash
-claude-toggle list                                # all MCP servers, per scope, with status
+claude-toggle list                                # all MCP servers per scope, with status + endpoint
 claude-toggle disable <server>                    # disable everywhere it's configured
+claude-toggle disable --all                       # disable every server
 claude-toggle disable <server> --project <path>   # disable for one project only
 claude-toggle disable <server> --global           # disable in global scope only
-claude-toggle enable <server> [--project <path>|--global]
+claude-toggle enable <server>|--all [--project <path>|--global]
 
 claude-toggle profile save <name>                 # snapshot MCP config + settings.json
 claude-toggle profile load <name>                 # restore a saved snapshot
 claude-toggle profile list
+
+claude-toggle backups                             # list auto-backups of ~/.claude.json
+claude-toggle restore                             # roll back to the latest backup
+claude-toggle restore claude.json.<stamp>         # roll back to a specific one
+claude-toggle version
 ```
 
 Example:

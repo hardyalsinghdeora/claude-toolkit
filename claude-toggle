@@ -8,22 +8,28 @@ moves it back. Every mutation first writes a timestamped backup of
 ~/.claude.json into ~/.claude/backups/.
 
 Usage:
-  claude-toggle list
-  claude-toggle disable <server> [--project <path>|--global]
-  claude-toggle enable  <server> [--project <path>|--global]
-  claude-toggle profile save <name>     # snapshot .claude.json mcp config + settings.json
+  claude-toggle list                     # all servers, status, endpoint
+  claude-toggle disable <server>|--all [--project <path>|--global]
+  claude-toggle enable  <server>|--all [--project <path>|--global]
+  claude-toggle profile save <name>      # snapshot MCP config + settings.json
   claude-toggle profile load <name>
   claude-toggle profile list
+  claude-toggle backups                  # list auto-backups of ~/.claude.json
+  claude-toggle restore [latest|<file>]  # restore a backup (default: latest)
 
 If neither --project nor --global is given, disable/enable acts on every
-scope where the server is found (or stashed).
+scope where the server is found (or stashed). Changes apply to NEW Claude
+Code sessions only.
 """
 
 import json
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+VERSION = "1.1.0"
 
 HOME = Path.home()
 CLAUDE_JSON = HOME / ".claude.json"
@@ -33,6 +39,7 @@ BACKUPS = HOME / ".claude" / "backups"
 PROFILES = HOME / ".claude" / "config-profiles"
 
 GLOBAL = "__global__"
+ALL = "--all"
 
 
 def load(path, default):
@@ -54,8 +61,23 @@ def backup_claude_json():
     BACKUPS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dest = BACKUPS / f"claude.json.{stamp}"
+    n = 1
+    while dest.exists():
+        dest = BACKUPS / f"claude.json.{stamp}-{n}"
+        n += 1
     shutil.copy2(CLAUDE_JSON, dest)
     return dest
+
+
+def warn_if_sessions_running():
+    try:
+        out = subprocess.run(["pgrep", "-fl", "claude"], capture_output=True, text=True).stdout
+        procs = [l for l in out.splitlines() if "claude-toggle" not in l]
+        if procs:
+            print(f"note: {len(procs)} claude process(es) running — a session exiting "
+                  "right now could overwrite this change (restore via 'claude-toggle restore').")
+    except OSError:
+        pass
 
 
 def scopes(cfg):
@@ -73,23 +95,28 @@ def scope_label(key):
     return "global" if key == GLOBAL else key
 
 
+def endpoint(sc):
+    return sc.get("url") or " ".join([sc.get("command", "")] + sc.get("args", [])).strip() or "?"
+
+
 def cmd_list():
     cfg = load(CLAUDE_JSON, {})
     stash = load(STASH, {})
     rows = []
     for key, servers in scopes(cfg):
         for name, sc in servers.items():
-            rows.append((scope_label(key), name, "enabled", sc.get("type", "stdio")))
+            rows.append((scope_label(key), name, "enabled", endpoint(sc)))
     for key, servers in stash.items():
         for name, sc in servers.items():
-            rows.append((scope_label(key), name, "DISABLED", sc.get("type", "stdio")))
+            rows.append((scope_label(key), name, "DISABLED", endpoint(sc)))
     if not rows:
         print("No MCP servers configured.")
         return
     w = max(len(r[0]) for r in rows)
-    print(f"{'SCOPE'.ljust(w)}  {'SERVER'.ljust(16)}  {'STATUS'.ljust(9)}  TYPE")
-    for scope, name, status, typ in sorted(rows):
-        print(f"{scope.ljust(w)}  {name.ljust(16)}  {status.ljust(9)}  {typ}")
+    n = max(len(r[1]) for r in rows)
+    print(f"{'SCOPE'.ljust(w)}  {'SERVER'.ljust(n)}  {'STATUS'.ljust(9)}  ENDPOINT")
+    for scope, name, status, ep in sorted(rows):
+        print(f"{scope.ljust(w)}  {name.ljust(n)}  {status.ljust(9)}  {ep}")
 
 
 def pick_scopes(arg_scope):
@@ -101,23 +128,30 @@ def pick_scopes(arg_scope):
     return lambda k: True
 
 
+def match(server, name):
+    return server == ALL or server == name
+
+
 def cmd_disable(server, arg_scope):
     cfg = load(CLAUDE_JSON, {})
     stash = load(STASH, {})
     wanted = pick_scopes(arg_scope)
     moved = []
     for key, servers in scopes(cfg):
-        if wanted(key) and server in servers:
-            stash.setdefault(key, {})[server] = servers.pop(server)
-            moved.append(key)
+        if not wanted(key):
+            continue
+        for name in [n for n in servers if match(server, n)]:
+            stash.setdefault(key, {})[name] = servers.pop(name)
+            moved.append((key, name))
     if not moved:
-        sys.exit(f"'{server}' not found enabled in the requested scope(s). Run 'claude-toggle list'.")
+        sys.exit(f"nothing to disable for '{server}' in the requested scope(s). Run 'claude-toggle list'.")
     print(f"backup: {backup_claude_json()}")
     save(STASH, stash)
     save(CLAUDE_JSON, cfg)
-    for key in moved:
-        print(f"disabled '{server}' in {scope_label(key)}")
-    print("Takes effect in new Claude Code sessions. Avoid toggling while closing a live session (it rewrites ~/.claude.json on exit).")
+    for key, name in moved:
+        print(f"disabled '{name}' in {scope_label(key)}")
+    warn_if_sessions_running()
+    print("Takes effect in new Claude Code sessions.")
 
 
 def cmd_enable(server, arg_scope):
@@ -126,22 +160,25 @@ def cmd_enable(server, arg_scope):
     wanted = pick_scopes(arg_scope)
     moved = []
     for key in list(stash.keys()):
-        if wanted(key) and server in stash[key]:
-            sc = stash[key].pop(server)
-            if not stash[key]:
-                del stash[key]
+        if not wanted(key):
+            continue
+        for name in [n for n in stash[key] if match(server, n)]:
+            sc = stash[key].pop(name)
             if key == GLOBAL:
-                cfg.setdefault("mcpServers", {})[server] = sc
+                cfg.setdefault("mcpServers", {})[name] = sc
             else:
-                cfg.setdefault("projects", {}).setdefault(key, {}).setdefault("mcpServers", {})[server] = sc
-            moved.append(key)
+                cfg.setdefault("projects", {}).setdefault(key, {}).setdefault("mcpServers", {})[name] = sc
+            moved.append((key, name))
+        if not stash[key]:
+            del stash[key]
     if not moved:
-        sys.exit(f"'{server}' not found in the disabled stash. Run 'claude-toggle list'.")
+        sys.exit(f"nothing to enable for '{server}' in the disabled stash. Run 'claude-toggle list'.")
     print(f"backup: {backup_claude_json()}")
     save(STASH, stash)
     save(CLAUDE_JSON, cfg)
-    for key in moved:
-        print(f"enabled '{server}' in {scope_label(key)}")
+    for key, name in moved:
+        print(f"enabled '{name}' in {scope_label(key)}")
+    warn_if_sessions_running()
     print("Takes effect in new Claude Code sessions.")
 
 
@@ -161,7 +198,8 @@ def cmd_profile(action, name=None):
         if not found:
             print("No saved profiles.")
         for p in found:
-            print(p.stem)
+            meta = load(p, {})
+            print(f"{p.stem}  (saved {meta.get('saved', '?')})")
         return
     if not name:
         sys.exit("profile save/load needs a name")
@@ -187,9 +225,41 @@ def cmd_profile(action, name=None):
         save(CLAUDE_JSON, cfg)
         save(STASH, prof.get("stash", {}))
         save(SETTINGS_JSON, prof.get("settings", {}))
+        warn_if_sessions_running()
         print(f"loaded profile '{name}' (saved {prof.get('saved', '?')}). Restart Claude Code sessions to apply.")
     else:
         sys.exit("profile action must be save, load, or list")
+
+
+def list_backups():
+    if not BACKUPS.exists():
+        return []
+    return sorted(BACKUPS.glob("claude.json.*"))
+
+
+def cmd_backups():
+    found = list_backups()
+    if not found:
+        print("No backups yet — one is created before every change.")
+    for p in found:
+        print(f"{p.name}  ({p.stat().st_size} bytes)")
+
+
+def cmd_restore(which):
+    found = list_backups()
+    if not found:
+        sys.exit("no backups to restore")
+    if which in (None, "latest"):
+        src = found[-1]
+    else:
+        src = BACKUPS / which
+        if not src.exists():
+            sys.exit(f"no backup named '{which}' — run 'claude-toggle backups'")
+    # back up the current state too, so a restore is itself reversible
+    print(f"pre-restore backup: {backup_claude_json()}")
+    shutil.copy2(src, CLAUDE_JSON)
+    print(f"restored ~/.claude.json from {src.name}")
+    warn_if_sessions_running()
 
 
 def main():
@@ -198,15 +268,17 @@ def main():
         print(__doc__)
         return
     cmd = args[0]
-    if cmd == "list":
+    if cmd in ("-v", "--version", "version"):
+        print(f"claude-toggle {VERSION}")
+    elif cmd == "list":
         cmd_list()
     elif cmd in ("disable", "enable"):
         if len(args) < 2:
-            sys.exit(f"usage: claude-toggle {cmd} <server> [--project <path>|--global]")
+            sys.exit(f"usage: claude-toggle {cmd} <server>|--all [--project <path>|--global]")
         server, scope = args[1], None
-        if "--global" in args:
+        if "--global" in args[2:]:
             scope = GLOBAL
-        elif "--project" in args:
+        if "--project" in args:
             i = args.index("--project")
             if i + 1 >= len(args):
                 sys.exit("--project needs a path")
@@ -216,6 +288,10 @@ def main():
         if len(args) < 2:
             sys.exit("usage: claude-toggle profile save|load|list [name]")
         cmd_profile(args[1], args[2] if len(args) > 2 else None)
+    elif cmd == "backups":
+        cmd_backups()
+    elif cmd == "restore":
+        cmd_restore(args[1] if len(args) > 1 else None)
     else:
         sys.exit(f"unknown command '{cmd}' — run 'claude-toggle help'")
 
