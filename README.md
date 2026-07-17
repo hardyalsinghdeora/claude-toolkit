@@ -102,17 +102,18 @@ In a Claude Code session, just say e.g. *"search the asset DB for X — credenti
 
 Install: same as claude-toggle (`cp claude-vault ~/.local/bin/`). macOS only.
 
-## core-db — query the CORE Postgres servers
+## db-conn — query any database via vault credentials
 
-Wrapper around `psql` that pulls the connection config from claude-vault (entries `prod-postgres-db`, `stg-postgres-db`, `test-postgres-db`, `local-postgres-db`) and the password from the matching per-member entry (`<env>-postgres-db.<dbuser>[.ro|.rw]`). Fails fast with a VPN hint when the host is unreachable.
+Engine-agnostic wrapper (Postgres and MySQL/MariaDB) that pulls the connection config from a claude-vault JSON entry — `{"engine":"postgres|mysql","host":..,"port":..,"user":..}`, engine guessed from the port if omitted — and the password from the matching per-member entry (`<entry>.<dbuser>[.ro|.rw]`). Fails fast with a VPN hint when the host is unreachable. (Replaces the old Postgres-only `core-db`.)
 
 ```bash
-core-db databases                                  # prod by default
-core-db --env stg tables iamdb
-core-db --env local iamdb "SELECT id, username FROM users LIMIT 5"
-core-db --user teammate2 iamdb "SELECT 1"          # another member's credentials
-core-db --role ro iamdb "SELECT ..."               # use the view-only password
-core-db iamdb -f lookup.sql --csv > out.csv
+db-conn list                                       # config entries in the vault
+db-conn prod-postgres-db iamdb "SELECT id, username FROM users LIMIT 5"
+db-conn --env stg tables iamdb                     # --env X == entry X-postgres-db
+db-conn asset-mysql-db assetdb "SELECT COUNT(*) FROM assets" --csv
+db-conn prod-postgres-db --user teammate2 iamdb "SELECT 1"
+db-conn prod-postgres-db --role ro iamdb "SELECT ..."   # view-only password
+db-conn prod-postgres-db iamdb -f lookup.sql --csv > out.csv
 ```
 
 ## Notes

@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# db-conn — run queries against any database server using credentials stored
+# in claude-vault, so no password ever appears on the command line, in shell
+# history, or in the transcript. Supports Postgres and MySQL/MariaDB.
+#
+# Config: a JSON vault entry, e.g.
+#   {"engine":"postgres","host":"..","port":"5432","user":".."}   (no password!)
+# `engine` is optional — guessed from the port (3306 -> mysql, else postgres).
+# Password: a password-type vault entry `<entry>.<dbuser>`, with optional role
+# variants `<entry>.<dbuser>.ro` / `.rw` (view-only vs update). Falls back to
+# the config's own `password` field for legacy entries.
+#
+# Usage:
+#   db-conn list                                  # config entries in the vault
+#   db-conn <entry> [--user U] [--role ro|rw] databases
+#   db-conn <entry> tables <database>
+#   db-conn <entry> <database> "<SQL>"            # inline SQL
+#   db-conn <entry> <database> -f query.sql       # SQL from a file
+#   db-conn <entry> <database> -f q.sql --csv     # CSV output
+#   db-conn --env prod|stg|test|local ...         # shorthand for <env>-postgres-db
+#
+# Examples:
+#   db-conn prod-postgres-db iamdb "SELECT id, username FROM users LIMIT 5"
+#   db-conn --env stg tables iamdb
+#   db-conn asset-mysql-db assetdb "SELECT COUNT(*) FROM assets" --csv
+#   db-conn prod-postgres-db --role ro iamdb "SELECT ..."
+
+set -euo pipefail
+
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; }
+
+vault() { claude-vault get "$@"; }
+
+tsv2csv() {
+  python3 -c 'import csv,sys; w=csv.writer(sys.stdout); [w.writerow(r) for r in csv.reader(sys.stdin, dialect="excel-tab")]'
+}
+
+ENTRY=""
+DBUSER=""
+ROLE=""
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env)   ENTRY="${2:?--env needs prod|stg|test|local}-postgres-db"; shift 2 ;;
+    --user)  DBUSER="${2:?--user needs a database user}"; shift 2 ;;
+    --role)  ROLE="${2:?--role needs ro or rw}"; shift 2 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#POS[@]} -eq 0 ] && [ -z "$ENTRY" ]; then
+  usage
+  exit 0
+fi
+
+if [ ${#POS[@]} -gt 0 ] && [ "${POS[0]}" = "list" ] && [ -z "$ENTRY" ]; then
+  # config entries are the json-typed ones
+  claude-vault list | awk 'NR==1 || $2=="json"'
+  exit 0
+fi
+
+if [ -z "$ENTRY" ]; then
+  ENTRY="${POS[0]}"
+  POS=("${POS[@]:1}")
+fi
+
+if ! claude-vault get "$ENTRY" >/dev/null 2>&1; then
+  echo "db-conn: no vault entry '$ENTRY' — run 'db-conn list'" >&2
+  exit 1
+fi
+
+HOST="$(vault "$ENTRY" --field host)"
+PORT="$(vault "$ENTRY" --field port 2>/dev/null || true)"
+ENGINE="$(vault "$ENTRY" --field engine 2>/dev/null || true)"
+if [ -z "$ENGINE" ]; then
+  case "$PORT" in 3306) ENGINE="mysql" ;; *) ENGINE="postgres" ;; esac
+fi
+case "$ENGINE" in
+  postgres|mysql) ;;
+  *) echo "db-conn: unsupported engine '$ENGINE' (supported: postgres, mysql)" >&2; exit 1 ;;
+esac
+if [ -z "$PORT" ]; then
+  case "$ENGINE" in mysql) PORT=3306 ;; *) PORT=5432 ;; esac
+fi
+USER_="${DBUSER:-$(vault "$ENTRY" --field user 2>/dev/null || echo "$USER")}"
+
+CLIENT="psql"; [ "$ENGINE" = "mysql" ] && CLIENT="mysql"
+if ! command -v "$CLIENT" >/dev/null; then
+  echo "db-conn: '$CLIENT' client not installed (needed for engine $ENGINE)" >&2
+  exit 1
+fi
+
+# Password resolution: per-member (+role) entry first, then legacy field.
+PASS=""
+if [ -n "$ROLE" ]; then
+  PASS="$(vault "$ENTRY.$USER_.$ROLE" 2>/dev/null || true)"
+  if [ -z "$PASS" ]; then
+    echo "db-conn: no password entry '$ENTRY.$USER_.$ROLE' in claude-vault" >&2
+    echo "         add one with: claude-vault set $ENTRY.$USER_.$ROLE --password" >&2
+    exit 1
+  fi
+else
+  PASS="$(vault "$ENTRY.$USER_" 2>/dev/null || true)"
+  [ -z "$PASS" ] && PASS="$(vault "$ENTRY" --field password 2>/dev/null || true)"
+  if [ -z "$PASS" ]; then
+    echo "db-conn: no password for user '$USER_' — expected vault entry '$ENTRY.$USER_'" >&2
+    echo "         add one with: claude-vault set $ENTRY.$USER_ --password" >&2
+    exit 1
+  fi
+fi
+
+# Fail fast if the server isn't reachable — private endpoints (e.g. RDS)
+# usually mean the VPN is disconnected.
+if ! nc -z -G 3 "$HOST" "$PORT" >/dev/null 2>&1; then
+  echo "db-conn: cannot reach $HOST:$PORT ($ENTRY)" >&2
+  echo "         if this is a private endpoint (VPC/RDS), connect to the VPN and retry" >&2
+  exit 1
+fi
+
+run_pg() {  # run_pg <database> [psql args...]
+  local db="$1"; shift
+  PGPASSWORD="$PASS" psql -h "$HOST" -p "$PORT" -U "$USER_" -d "$db" \
+    -v ON_ERROR_STOP=1 "$@"
+}
+
+run_my() {  # run_my [mysql args...]  (database passed by caller when needed)
+  MYSQL_PWD="$PASS" mysql -h "$HOST" -P "$PORT" -u "$USER_" --protocol=TCP "$@"
+}
+
+cmd="${POS[0]:-}"
+case "$cmd" in
+  "")
+    usage
+    exit 0
+    ;;
+  databases)
+    if [ "$ENGINE" = "mysql" ]; then
+      run_my -N -B -e "SHOW DATABASES;"
+    else
+      run_pg postgres -tAc "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1;"
+    fi
+    ;;
+  tables)
+    db="${POS[1]:?usage: db-conn <entry> tables <database>}"
+    if [ "$ENGINE" = "mysql" ]; then
+      run_my -N -B "$db" -e "SHOW TABLES;"
+    else
+      run_pg "$db" -tAc "SELECT table_schema||'.'||table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1;"
+    fi
+    ;;
+  *)
+    db="$cmd"
+    csv=0; sql=""; file=""
+    i=1
+    while [ $i -lt ${#POS[@]} ]; do
+      case "${POS[$i]}" in
+        --csv) csv=1 ;;
+        -f) i=$((i+1)); file="${POS[$i]}" ;;
+        *) sql="${POS[$i]}" ;;
+      esac
+      i=$((i+1))
+    done
+    if [ -z "$sql" ] && [ -z "$file" ]; then
+      echo "db-conn: no SQL given — pass \"<SQL>\" or -f query.sql" >&2
+      exit 1
+    fi
+    if [ "$ENGINE" = "mysql" ]; then
+      if [ -n "$file" ]; then
+        if [ "$csv" -eq 1 ]; then run_my -B "$db" < "$file" | tsv2csv
+        else run_my --table "$db" < "$file"; fi
+      else
+        if [ "$csv" -eq 1 ]; then run_my -B "$db" -e "$sql" | tsv2csv
+        else run_my --table "$db" -e "$sql"; fi
+      fi
+    else
+      args=()
+      [ -n "$file" ] && args+=(-f "$file")
+      [ -n "$sql" ] && args+=(-c "$sql")
+      if [ "$csv" -eq 1 ]; then run_pg "$db" --csv "${args[@]}"
+      else run_pg "$db" "${args[@]}"; fi
+    fi
+    ;;
+esac
