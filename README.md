@@ -82,9 +82,9 @@ as a separate password-type entry. Role variants let a view-only password differ
 from an update password:
 
 ```
-prod-core-db                     {"host":..,"port":..,"user":..}
-prod-core-db.<dbuser>            password-type, one per member
-prod-core-db.<dbuser>.ro / .rw   optional: view-only vs update passwords
+prod-postgres-db                     {"host":..,"port":..,"user":..}
+prod-postgres-db.<dbuser>            password-type, one per member
+prod-postgres-db.<dbuser>.ro / .rw   optional: view-only vs update passwords
 ```
 
 Never pass the secret itself as a CLI argument — it would land in shell history and `ps` output; use the hidden prompt, `--stdin`, or `--from-clipboard`.
@@ -104,7 +104,7 @@ Install: same as claude-toggle (`cp claude-vault ~/.local/bin/`). macOS only.
 
 ## core-db — query the CORE Postgres servers
 
-Wrapper around `psql` that pulls the connection config from claude-vault (entries `prod-core-db`, `stg-core-db`, `test-core-db`, `local-core-db`) and the password from the matching per-member entry (`<env>-core-db.<dbuser>[.ro|.rw]`). Fails fast with a VPN hint when the host is unreachable.
+Wrapper around `psql` that pulls the connection config from claude-vault (entries `prod-postgres-db`, `stg-postgres-db`, `test-postgres-db`, `local-postgres-db`) and the password from the matching per-member entry (`<env>-postgres-db.<dbuser>[.ro|.rw]`). Fails fast with a VPN hint when the host is unreachable.
 
 ```bash
 core-db databases                                  # prod by default

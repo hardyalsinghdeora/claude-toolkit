@@ -3,10 +3,10 @@
 # stored in claude-vault, so no password ever appears on the command line,
 # in shell history, or in the transcript.
 #
-# Connection config comes from the vault entry `<env>-core-db` (JSON with
+# Connection config comes from the vault entry `<env>-postgres-db` (JSON with
 # host/port/user — no password). The password is a separate password-type
-# vault entry, one per team member: `<env>-core-db.<dbuser>`, with optional
-# role variants `<env>-core-db.<dbuser>.ro` / `.rw` (view-only vs update).
+# vault entry, one per team member: `<env>-postgres-db.<dbuser>`, with optional
+# role variants `<env>-postgres-db.<dbuser>.ro` / `.rw` (view-only vs update).
 # Falls back to the config's own `password` field for legacy entries.
 # Default environment is prod.
 #
@@ -54,7 +54,7 @@ if [ -z "$cmd" ] || [ "$cmd" = "-h" ] || [ "$cmd" = "--help" ] || [ "$cmd" = "he
   exit 0
 fi
 
-ENTRY="${ENV}-core-db"
+ENTRY="${ENV}-postgres-db"
 vault() { claude-vault get "$@"; }
 
 HOST="$(vault "$ENTRY" --field host)"
