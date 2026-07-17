@@ -24,10 +24,13 @@ claude-toggle disable <server> --global           # disable in global scope only
 claude-toggle enable <server>|--all [--project <path>|--global]
 
 claude-toggle profile save <name>                 # snapshot MCP config + settings.json
-claude-toggle profile load <name>                 # restore a saved snapshot
+claude-toggle profile load <name>                 # restore MCP config from a snapshot
+claude-toggle profile load <name> --all           # ...also overwrite settings.json
+claude-toggle profile load <name> --settings-only # ...only settings.json
 claude-toggle profile list
 
-claude-toggle backups                             # list auto-backups of ~/.claude.json
+claude-toggle backups                             # list auto-backups
+claude-toggle backups prune --keep 10             # trim old backups (auto-kept at 20)
 claude-toggle restore                             # roll back to the latest backup
 claude-toggle restore claude.json.<stamp>         # roll back to a specific one
 claude-toggle version
@@ -58,8 +61,33 @@ claude-vault set jira-token --desc "Jira API token"
 claude-vault list                        # names + descriptions only, no values
 claude-vault get asset-db --field host   # one field of a JSON secret
 claude-vault get jira-token              # whole value
+claude-vault set asset-db --field password   # update ONE field, keep the rest
+claude-vault set jira-token --from-clipboard # take the value from the clipboard
+printf '%s\n' "$VAL" | claude-vault set x --stdin   # scriptable set
+claude-vault rename asset-db asset-db-old
 claude-vault delete jira-token
+
+claude-vault set my-pw --password        # password-type: NEVER displayed on a
+                                         # terminal — usable only via $(...) /
+                                         # pipes, or `get my-pw --copy`
+claude-vault pin enable my-pw            # optional per-entry PIN lock (default off):
+                                         # value stored PBKDF2-encrypted, reads
+                                         # prompt for the PIN
+claude-vault pin disable my-pw
 ```
+
+**Team convention — shared DB config, per-member passwords.** Keep the connection
+config (host/port/user, *no password*) as a JSON entry, and each member's password
+as a separate password-type entry. Role variants let a view-only password differ
+from an update password:
+
+```
+prod-core-db                     {"host":..,"port":..,"user":..}
+prod-core-db.<dbuser>            password-type, one per member
+prod-core-db.<dbuser>.ro / .rw   optional: view-only vs update passwords
+```
+
+Never pass the secret itself as a CLI argument — it would land in shell history and `ps` output; use the hidden prompt, `--stdin`, or `--from-clipboard`.
 
 Example — query a DB using stored credentials:
 
@@ -73,6 +101,19 @@ mysql -h "$(claude-vault get asset-db --field host)" \
 In a Claude Code session, just say e.g. *"search the asset DB for X — credentials are in claude-vault under `asset-db`"*.
 
 Install: same as claude-toggle (`cp claude-vault ~/.local/bin/`). macOS only.
+
+## core-db — query the CORE Postgres servers
+
+Wrapper around `psql` that pulls the connection config from claude-vault (entries `prod-core-db`, `stg-core-db`, `test-core-db`, `local-core-db`) and the password from the matching per-member entry (`<env>-core-db.<dbuser>[.ro|.rw]`). Fails fast with a VPN hint when the host is unreachable.
+
+```bash
+core-db databases                                  # prod by default
+core-db --env stg tables iamdb
+core-db --env local iamdb "SELECT id, username FROM users LIMIT 5"
+core-db --user teammate2 iamdb "SELECT 1"          # another member's credentials
+core-db --role ro iamdb "SELECT ..."               # use the view-only password
+core-db iamdb -f lookup.sql --csv > out.csv
+```
 
 ## Notes
 

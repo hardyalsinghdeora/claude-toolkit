@@ -12,10 +12,13 @@ Usage:
   claude-toggle disable <server>|--all [--project <path>|--global]
   claude-toggle enable  <server>|--all [--project <path>|--global]
   claude-toggle profile save <name>      # snapshot MCP config + settings.json
-  claude-toggle profile load <name>
+  claude-toggle profile load <name> [--all|--settings-only]
+                                         # default loads MCP config ONLY;
+                                         # --all also overwrites settings.json
   claude-toggle profile list
-  claude-toggle backups                  # list auto-backups of ~/.claude.json
-  claude-toggle restore [latest|<file>]  # restore a backup (default: latest)
+  claude-toggle backups                  # list auto-backups
+  claude-toggle backups prune [--keep N] # trim old backups (default keep 20)
+  claude-toggle restore [latest|<file>]  # restore a ~/.claude.json backup (default: latest)
 
 If neither --project nor --global is given, disable/enable acts on every
 scope where the server is found (or stashed). Changes apply to NEW Claude
@@ -29,7 +32,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HOME = Path.home()
 CLAUDE_JSON = HOME / ".claude.json"
@@ -40,6 +43,8 @@ PROFILES = HOME / ".claude" / "config-profiles"
 
 GLOBAL = "__global__"
 ALL = "--all"
+KEEP_BACKUPS = 20
+BACKUP_PATTERNS = ("claude.json.*", "settings.json.*")
 
 
 def load(path, default):
@@ -57,16 +62,37 @@ def save(path, data):
     tmp.replace(path)
 
 
-def backup_claude_json():
+def backup_file(src, prefix):
     BACKUPS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = BACKUPS / f"claude.json.{stamp}"
+    dest = BACKUPS / f"{prefix}.{stamp}"
     n = 1
     while dest.exists():
-        dest = BACKUPS / f"claude.json.{stamp}-{n}"
+        dest = BACKUPS / f"{prefix}.{stamp}-{n}"
         n += 1
-    shutil.copy2(CLAUDE_JSON, dest)
+    shutil.copy2(src, dest)
+    prune_backups(KEEP_BACKUPS)
     return dest
+
+
+def backup_claude_json():
+    return backup_file(CLAUDE_JSON, "claude.json")
+
+
+def backup_settings_json():
+    if not SETTINGS_JSON.exists():
+        return None
+    return backup_file(SETTINGS_JSON, "settings.json")
+
+
+def prune_backups(keep):
+    removed = 0
+    for pattern in BACKUP_PATTERNS:
+        found = sorted(BACKUPS.glob(pattern)) if BACKUPS.exists() else []
+        for p in found[:-keep] if keep > 0 else found:
+            p.unlink()
+            removed += 1
+    return removed
 
 
 def warn_if_sessions_running():
@@ -191,7 +217,7 @@ def mcp_snapshot(cfg):
     return snap
 
 
-def cmd_profile(action, name=None):
+def cmd_profile(action, name=None, mode="mcp-only"):
     PROFILES.mkdir(parents=True, exist_ok=True)
     if action == "list":
         found = sorted(PROFILES.glob("*.json"))
@@ -217,16 +243,27 @@ def cmd_profile(action, name=None):
         if not pfile.exists():
             sys.exit(f"no profile named '{name}'")
         prof = load(pfile, {})
-        cfg = load(CLAUDE_JSON, {})
-        print(f"backup: {backup_claude_json()}")
-        cfg["mcpServers"] = prof["mcp"].get("mcpServers", {})
-        for proj, pdata in prof["mcp"].get("projects", {}).items():
-            cfg.setdefault("projects", {}).setdefault(proj, {})["mcpServers"] = pdata["mcpServers"]
-        save(CLAUDE_JSON, cfg)
-        save(STASH, prof.get("stash", {}))
-        save(SETTINGS_JSON, prof.get("settings", {}))
+        applied = []
+        if mode in ("mcp-only", "all"):
+            cfg = load(CLAUDE_JSON, {})
+            print(f"backup: {backup_claude_json()}")
+            cfg["mcpServers"] = prof["mcp"].get("mcpServers", {})
+            for proj, pdata in prof["mcp"].get("projects", {}).items():
+                cfg.setdefault("projects", {}).setdefault(proj, {})["mcpServers"] = pdata["mcpServers"]
+            save(CLAUDE_JSON, cfg)
+            save(STASH, prof.get("stash", {}))
+            applied.append("MCP config")
+        if mode in ("settings-only", "all"):
+            b = backup_settings_json()
+            if b:
+                print(f"settings backup: {b}")
+            save(SETTINGS_JSON, prof.get("settings", {}))
+            applied.append("settings.json")
         warn_if_sessions_running()
-        print(f"loaded profile '{name}' (saved {prof.get('saved', '?')}). Restart Claude Code sessions to apply.")
+        print(f"loaded profile '{name}' (saved {prof.get('saved', '?')}): applied {' + '.join(applied)}.")
+        if mode == "mcp-only":
+            print("settings.json untouched — use --all to overwrite it from the profile.")
+        print("Restart Claude Code sessions to apply.")
     else:
         sys.exit("profile action must be save, load, or list")
 
@@ -237,12 +274,27 @@ def list_backups():
     return sorted(BACKUPS.glob("claude.json.*"))
 
 
+def all_backups():
+    if not BACKUPS.exists():
+        return []
+    out = []
+    for pattern in BACKUP_PATTERNS:
+        out.extend(BACKUPS.glob(pattern))
+    return sorted(out)
+
+
 def cmd_backups():
-    found = list_backups()
+    found = all_backups()
     if not found:
         print("No backups yet — one is created before every change.")
     for p in found:
         print(f"{p.name}  ({p.stat().st_size} bytes)")
+
+
+def cmd_backups_prune(keep):
+    removed = prune_backups(keep)
+    remaining = len(all_backups())
+    print(f"pruned {removed} backup(s), {remaining} kept (newest {keep} per file)")
 
 
 def cmd_restore(which):
@@ -286,10 +338,25 @@ def main():
         (cmd_disable if cmd == "disable" else cmd_enable)(server, scope)
     elif cmd == "profile":
         if len(args) < 2:
-            sys.exit("usage: claude-toggle profile save|load|list [name]")
-        cmd_profile(args[1], args[2] if len(args) > 2 else None)
+            sys.exit("usage: claude-toggle profile save|load|list [name] [--all|--settings-only]")
+        mode = "mcp-only"
+        if "--all" in args[2:]:
+            mode = "all"
+        if "--settings-only" in args[2:]:
+            mode = "settings-only"
+        rest = [a for a in args[1:] if not a.startswith("--")]
+        cmd_profile(rest[0], rest[1] if len(rest) > 1 else None, mode)
     elif cmd == "backups":
-        cmd_backups()
+        if len(args) > 1 and args[1] == "prune":
+            keep = KEEP_BACKUPS
+            if "--keep" in args:
+                i = args.index("--keep")
+                if i + 1 >= len(args) or not args[i + 1].isdigit():
+                    sys.exit("--keep needs a number")
+                keep = int(args[i + 1])
+            cmd_backups_prune(keep)
+        else:
+            cmd_backups()
     elif cmd == "restore":
         cmd_restore(args[1] if len(args) > 1 else None)
     else:

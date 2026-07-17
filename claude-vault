@@ -14,31 +14,55 @@ Usage:
   claude-vault set <name> [--desc "text"]     # prompts for the secret (hidden)
   claude-vault set <name> --json              # prompts for a JSON blob, e.g.
                                               #   {"host":"..","user":"..","password":".."}
-  claude-vault get <name>                     # print the secret value
+  claude-vault set <name> --password          # password-type: value is NEVER displayed
+  claude-vault set <name> --field <key>       # update ONE field of a JSON secret
+  claude-vault set <name> --stdin             # read the value from stdin (scripts/AI)
+  claude-vault set <name> --from-clipboard    # take the value from the clipboard
+  claude-vault get <name>                     # print the secret value (see below)
   claude-vault get <name> --field password    # print one field of a JSON secret
+  claude-vault get <name> --copy              # put the value on the clipboard instead
+  claude-vault rename <old> <new>             # rename an entry (value unchanged)
+  claude-vault pin enable <name>              # PIN-lock an entry (default: no PIN)
+  claude-vault pin disable <name>
   claude-vault list                           # names + descriptions only, no values
   claude-vault delete <name>
   claude-vault help
 
-Examples:
-  claude-vault set asset-db --json --desc "MySQL for asset-logistic"
-  claude-vault get asset-db --field host
-  mysql -h "$(claude-vault get asset-db --field host)" \\
-        -u "$(claude-vault get asset-db --field user)" \\
-        -p"$(claude-vault get asset-db --field password)"
+Password-type entries are never printed to a terminal — only into a pipe or
+command substitution ($(claude-vault get ...)), or onto the clipboard with
+--copy. This lets scripts and AI sessions use them without a human (or a
+screen-share audience) ever seeing the value.
+
+Team convention — shared DB config, per-member passwords:
+  prod-core-db                     JSON config: {"host":..,"port":..,"user":..}  (no password!)
+  prod-core-db.<dbuser>            password-type entry, one per member
+  prod-core-db.<dbuser>.ro / .rw   optional role variants (view-only vs update)
+The core-db helper resolves these automatically (--user / --role flags).
+
+PIN lock (optional, off by default): `pin enable <name>` encrypts the stored
+value with a key derived from your PIN (PBKDF2-HMAC-SHA256, 200k iterations,
+HMAC integrity check). Anyone with access to the Mac account then still needs
+the PIN to read that entry. Each entry can have its own PIN.
+
+Never pass the secret itself as a command-line argument — it would land in
+shell history and `ps` output. Use the hidden prompt, --stdin, or --from-clipboard.
 """
 
 import getpass
+import hashlib
+import hmac as hmac_mod
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 SERVICE_PREFIX = "claude-vault."
 INDEX = Path.home() / ".claude" / "vault-index.json"
 ACCOUNT = getpass.getuser()
+PBKDF2_ITER = 200_000
 
 
 def load_index():
@@ -55,6 +79,10 @@ def save_index(idx):
         json.dump(idx, f, indent=2)
     tmp.replace(INDEX)
     INDEX.chmod(0o600)
+
+
+def entry_type(meta):
+    return meta.get("type") or ("json" if meta.get("json") else "plain")
 
 
 def keychain(args, **kw):
@@ -83,35 +111,155 @@ def kc_delete(name):
     return r.returncode == 0
 
 
-def cmd_set(name, as_json, desc):
-    if as_json:
-        print("Paste the JSON value (one line), e.g. {\"host\":\"..\",\"user\":\"..\",\"password\":\"..\"}:",
-              file=sys.stderr)
-        raw = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("JSON value (hidden): ")
-        try:
-            json.loads(raw)
-        except json.JSONDecodeError as e:
-            sys.exit(f"not valid JSON: {e}")
-        value = raw
+# ---------- PIN lock (PBKDF2 stream cipher + HMAC, stdlib only) ----------
+
+def _derive(pin, salt, iters):
+    key = hashlib.pbkdf2_hmac("sha256", pin.encode(), salt, iters, 64)
+    return key[:32], key[32:]
+
+
+def _keystream(enc_key, n):
+    out = b""
+    ctr = 0
+    while len(out) < n:
+        out += hashlib.sha256(enc_key + ctr.to_bytes(8, "big")).digest()
+        ctr += 1
+    return out[:n]
+
+
+def pin_encrypt(value, pin):
+    salt = os.urandom(16)
+    enc_key, mac_key = _derive(pin, salt, PBKDF2_ITER)
+    data = value.encode()
+    ct = bytes(a ^ b for a, b in zip(data, _keystream(enc_key, len(data))))
+    tag = hmac_mod.new(mac_key, salt + ct, hashlib.sha256).hexdigest()
+    return json.dumps({"__pin__": 1, "iter": PBKDF2_ITER,
+                       "salt": salt.hex(), "ct": ct.hex(), "tag": tag})
+
+
+def is_pin_locked(raw):
+    try:
+        d = json.loads(raw)
+        return isinstance(d, dict) and d.get("__pin__") == 1
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
+def pin_decrypt(raw, pin):
+    d = json.loads(raw)
+    salt = bytes.fromhex(d["salt"])
+    enc_key, mac_key = _derive(pin, salt, d.get("iter", PBKDF2_ITER))
+    ct = bytes.fromhex(d["ct"])
+    tag = hmac_mod.new(mac_key, salt + ct, hashlib.sha256).hexdigest()
+    if not hmac_mod.compare_digest(tag, d["tag"]):
+        sys.exit("wrong PIN")
+    return bytes(a ^ b for a, b in zip(ct, _keystream(enc_key, len(ct)))).decode()
+
+
+def read_pin(prompt):
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, OSError):
+        return sys.stdin.readline().strip()
+
+
+def unlock(name, raw):
+    """Return the plaintext value and the PIN used (None if not locked)."""
+    if not is_pin_locked(raw):
+        return raw, None
+    pin = read_pin(f"PIN for '{name}': ")
+    return pin_decrypt(raw, pin), pin
+
+
+# ---------- value input ----------
+
+def read_value(hidden_prompt, use_stdin, from_clipboard):
+    if from_clipboard:
+        r = subprocess.run(["pbpaste"], capture_output=True, text=True)
+        if r.returncode != 0 or not r.stdout.strip():
+            sys.exit("clipboard is empty or unreadable")
+        return r.stdout.strip()
+    if use_stdin or not sys.stdin.isatty():
+        return sys.stdin.readline().strip()
+    return getpass.getpass(hidden_prompt)
+
+
+def offer_clipboard_clear():
+    if sys.stdin.isatty():
+        ans = input("Clear the clipboard now? [Y/n] ").strip().lower()
+        if ans in ("", "y", "yes"):
+            subprocess.run(["pbcopy"], input="", text=True)
+            print("clipboard cleared")
     else:
-        value = sys.stdin.readline().rstrip("\n") if not sys.stdin.isatty() else getpass.getpass("Secret value (hidden): ")
-    if not value:
-        sys.exit("empty value — nothing stored")
-    kc_set(name, value)
+        print("note: the secret is still on your clipboard — clear it with: pbcopy </dev/null")
+
+
+# ---------- commands ----------
+
+def cmd_set(name, type_, desc, field=None, use_stdin=False, from_clipboard=False):
     idx = load_index()
+    existing_raw = kc_get(name)
+    pin = None
+    if field:
+        if existing_raw is None:
+            sys.exit(f"no secret named '{name}' — --field updates an existing JSON secret")
+        current, pin = unlock(name, existing_raw)
+        try:
+            data = json.loads(current)
+        except json.JSONDecodeError:
+            sys.exit(f"'{name}' is not a JSON secret — cannot update field '{field}'")
+        new = read_value(f"New value for '{field}' (hidden): ", use_stdin, from_clipboard)
+        if not new:
+            sys.exit("empty value — nothing stored")
+        data[field] = new
+        value = json.dumps(data)
+        type_ = entry_type(idx.get(name, {"type": "json"}))
+        done = f"updated field '{field}' of '{name}' in macOS Keychain"
+    else:
+        if type_ is None:
+            # no explicit --json/--password: keep the existing entry's type
+            type_ = entry_type(idx[name]) if name in idx else "plain"
+        if existing_raw is not None and is_pin_locked(existing_raw):
+            # verify the PIN before overwriting; the entry stays locked with it
+            _, pin = unlock(name, existing_raw)
+        if type_ == "json" and not from_clipboard:
+            print("Paste the JSON value (one line), e.g. {\"host\":\"..\",\"user\":\"..\",\"password\":\"..\"}:",
+                  file=sys.stderr)
+        prompt = {"json": "JSON value (hidden): ",
+                  "password": "Password value (hidden): "}.get(type_, "Secret value (hidden): ")
+        value = read_value(prompt, use_stdin, from_clipboard)
+        if not value:
+            sys.exit("empty value — nothing stored")
+        if type_ == "json":
+            try:
+                json.loads(value)
+            except json.JSONDecodeError as e:
+                sys.exit(f"not valid JSON: {e}")
+        if type_ == "password":
+            done = f"stored '{name}' in macOS Keychain (password value, length hidden)"
+        else:
+            done = f"stored '{name}' in macOS Keychain ({type_} value, {len(value)} chars)"
+    if pin:
+        value = pin_encrypt(value, pin)
+    kc_set(name, value)
     idx[name] = {
         "desc": desc or idx.get(name, {}).get("desc", ""),
-        "json": as_json,
+        "type": type_,
+        "pin": bool(pin),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     save_index(idx)
-    print(f"stored '{name}' in macOS Keychain ({'JSON' if as_json else 'plain'} value, {len(value)} chars)")
+    print(done)
+    if from_clipboard:
+        offer_clipboard_clear()
 
 
-def cmd_get(name, field):
-    value = kc_get(name)
-    if value is None:
+def cmd_get(name, field, copy=False):
+    raw = kc_get(name)
+    if raw is None:
         sys.exit(f"no secret named '{name}' — run 'claude-vault list'")
+    meta = load_index().get(name, {})
+    value, _ = unlock(name, raw)
     if field:
         try:
             data = json.loads(value)
@@ -122,6 +270,13 @@ def cmd_get(name, field):
         value = data[field]
         if not isinstance(value, str):
             value = json.dumps(value)
+    if copy:
+        subprocess.run(["pbcopy"], input=value, text=True)
+        print(f"'{name}' copied to clipboard — clear it later with: pbcopy </dev/null", file=sys.stderr)
+        return
+    if entry_type(meta) == "password" and sys.stdout.isatty():
+        sys.exit(f"'{name}' is a password-type entry — its value is never displayed.\n"
+                 f"Use it inside a command: $(claude-vault get {name})   or: claude-vault get {name} --copy")
     print(value)
 
 
@@ -130,11 +285,71 @@ def cmd_list():
     if not idx:
         print("Vault is empty. Add one with: claude-vault set <name>")
         return
-    w = max(len(n) for n in idx)
-    print(f"{'NAME'.ljust(w)}  {'TYPE'.ljust(5)}  {'UPDATED'.ljust(19)}  DESCRIPTION")
+    w = max(max(len(n) for n in idx), 4)
+    t = max(max(len(entry_type(m)) for m in idx.values()), 4)
+    print(f"{'NAME'.ljust(w)}  {'TYPE'.ljust(t)}  {'PIN'.ljust(3)}  {'UPDATED'.ljust(19)}  DESCRIPTION")
     for name, meta in sorted(idx.items()):
-        typ = "json" if meta.get("json") else "plain"
-        print(f"{name.ljust(w)}  {typ.ljust(5)}  {meta.get('updated', '?').ljust(19)}  {meta.get('desc', '')}")
+        pin = "yes" if meta.get("pin") else "-"
+        print(f"{name.ljust(w)}  {entry_type(meta).ljust(t)}  {pin.ljust(3)}  "
+              f"{meta.get('updated', '?').ljust(19)}  {meta.get('desc', '')}")
+
+
+def cmd_rename(old, new):
+    if old == new:
+        sys.exit("old and new names are the same")
+    value = kc_get(old)
+    if value is None:
+        sys.exit(f"no secret named '{old}' — run 'claude-vault list'")
+    if kc_get(new) is not None:
+        sys.exit(f"'{new}' already exists — delete it first if you really mean to overwrite")
+    kc_set(new, value)
+    idx = load_index()
+    meta = idx.pop(old, None)
+    if meta is None:
+        # entry existed only in the Keychain (index drift) — rebuild minimal meta
+        try:
+            json.loads(value)
+            is_json = True
+        except json.JSONDecodeError:
+            is_json = False
+        meta = {"desc": "", "type": "json" if is_json else "plain", "pin": is_pin_locked(value)}
+    meta["updated"] = datetime.now().isoformat(timespec="seconds")
+    idx[new] = meta
+    save_index(idx)
+    kc_delete(old)
+    print(f"renamed '{old}' -> '{new}'")
+
+
+def cmd_pin(action, name):
+    raw = kc_get(name)
+    if raw is None:
+        sys.exit(f"no secret named '{name}' — run 'claude-vault list'")
+    idx = load_index()
+    meta = idx.setdefault(name, {"desc": "", "type": "plain"})
+    if action == "enable":
+        if is_pin_locked(raw):
+            sys.exit(f"'{name}' is already PIN-locked")
+        pin = read_pin(f"New PIN for '{name}': ")
+        pin2 = read_pin("Repeat PIN: ")
+        if not pin:
+            sys.exit("empty PIN — nothing changed")
+        if pin != pin2:
+            sys.exit("PINs do not match — nothing changed")
+        kc_set(name, pin_encrypt(raw, pin))
+        meta["pin"] = True
+        print(f"PIN enabled for '{name}' — reads now require the PIN. Don't lose it: "
+              "the value cannot be recovered without it.")
+    elif action == "disable":
+        if not is_pin_locked(raw):
+            sys.exit(f"'{name}' is not PIN-locked")
+        pin = read_pin(f"PIN for '{name}': ")
+        kc_set(name, pin_decrypt(raw, pin))
+        meta["pin"] = False
+        print(f"PIN disabled for '{name}'")
+    else:
+        sys.exit("usage: claude-vault pin enable|disable <name>")
+    meta["updated"] = datetime.now().isoformat(timespec="seconds")
+    save_index(idx)
 
 
 def cmd_delete(name):
@@ -161,27 +376,50 @@ def main():
     if sys.platform != "darwin":
         sys.exit("claude-vault uses the macOS Keychain and only runs on macOS")
     if cmd == "set":
-        if len(args) < 2:
-            sys.exit("usage: claude-vault set <name> [--json] [--desc \"text\"]")
+        if len(args) < 2 or args[1].startswith("--"):
+            sys.exit("usage: claude-vault set <name> [--json|--password] [--field <key>] "
+                     "[--stdin] [--from-clipboard] [--desc \"text\"]")
         name = args[1]
         as_json = "--json" in args
+        as_password = "--password" in args
+        if as_json and as_password:
+            sys.exit("--json and --password are mutually exclusive")
+        type_ = "json" if as_json else "password" if as_password else None
+        use_stdin = "--stdin" in args
+        from_clipboard = "--from-clipboard" in args
+        if use_stdin and from_clipboard:
+            sys.exit("--stdin and --from-clipboard are mutually exclusive")
         desc = ""
         if "--desc" in args:
             i = args.index("--desc")
             if i + 1 >= len(args):
                 sys.exit("--desc needs a value")
             desc = args[i + 1]
-        cmd_set(name, as_json, desc)
-    elif cmd == "get":
-        if len(args) < 2:
-            sys.exit("usage: claude-vault get <name> [--field <key>]")
         field = None
         if "--field" in args:
             i = args.index("--field")
             if i + 1 >= len(args):
                 sys.exit("--field needs a key")
             field = args[i + 1]
-        cmd_get(args[1], field)
+        cmd_set(name, type_, desc, field, use_stdin, from_clipboard)
+    elif cmd == "get":
+        if len(args) < 2:
+            sys.exit("usage: claude-vault get <name> [--field <key>] [--copy]")
+        field = None
+        if "--field" in args:
+            i = args.index("--field")
+            if i + 1 >= len(args):
+                sys.exit("--field needs a key")
+            field = args[i + 1]
+        cmd_get(args[1], field, copy="--copy" in args)
+    elif cmd == "rename":
+        if len(args) < 3:
+            sys.exit("usage: claude-vault rename <old> <new>")
+        cmd_rename(args[1], args[2])
+    elif cmd == "pin":
+        if len(args) < 3:
+            sys.exit("usage: claude-vault pin enable|disable <name>")
+        cmd_pin(args[1], args[2])
     elif cmd == "list":
         cmd_list()
     elif cmd == "delete":
