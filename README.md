@@ -1,4 +1,12 @@
-# claude-toggle
+# claude-toolkit
+
+Small, dependency-free CLI tools that make AI coding sessions (Claude Code) safer and smoother:
+
+- **claude-toggle** — enable/disable MCP servers without losing their config; profiles, backups, restore
+- **claude-vault** — secrets in the macOS Keychain, built to be *used* by AI sessions without ever being *seen* (password-type entries, per-member DB passwords, optional PIN lock)
+- **db-conn** — query Postgres/MySQL with vault-stored credentials; no password ever touches the command line or transcript
+
+## claude-toggle — MCP servers on/off
 
 Enable/disable local MCP servers for Claude Code without losing their configuration, and save/restore whole config profiles.
 
@@ -108,12 +116,12 @@ Engine-agnostic wrapper (Postgres and MySQL/MariaDB) that pulls the connection c
 
 ```bash
 db-conn list                                       # config entries in the vault
-db-conn prod-postgres-db iamdb "SELECT id, username FROM users LIMIT 5"
-db-conn --env stg tables iamdb                     # --env X == entry X-postgres-db
+db-conn prod-postgres-db mydb "SELECT id, username FROM users LIMIT 5"
+db-conn --env stg tables mydb                     # --env X == entry X-postgres-db
 db-conn asset-mysql-db assetdb "SELECT COUNT(*) FROM assets" --csv
-db-conn prod-postgres-db --user teammate2 iamdb "SELECT 1"
-db-conn prod-postgres-db --role ro iamdb "SELECT ..."   # view-only password
-db-conn prod-postgres-db iamdb -f lookup.sql --csv > out.csv
+db-conn prod-postgres-db --user teammate2 mydb "SELECT 1"
+db-conn prod-postgres-db --role ro mydb "SELECT ..."   # view-only password
+db-conn prod-postgres-db mydb -f lookup.sql --csv > out.csv
 ```
 
 ## Notes

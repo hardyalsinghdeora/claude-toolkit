@@ -108,7 +108,7 @@ Before running psql, probe the host (`nc -z -G 3 $HOST $PORT`). On failure print
 `core-db --env prod|stg|test|local ...` (default `prod`) selecting the `<env>-core-db` vault entry. All four entries already exist with identical shape, so this is just string substitution.
 
 ### C4. Prod write guard — **P1, small**
-Default to blocking statements matching `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE` when `--env prod`, unless `--write` is passed. A one-line regex gate that makes the common case (read-only lookups for support requests, like the mse.xlsx task) safe by construction.
+Default to blocking statements matching `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE` when `--env prod`, unless `--write` is passed. A one-line regex gate that makes the common case (read-only lookups for support requests) safe by construction.
 
 ### C5. Convenience output modes — **P2, small**
 `--xlsx <file>` / `--md` output via a tiny Python helper, since query results regularly end up in Excel deliverables anyway.

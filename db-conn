@@ -20,10 +20,10 @@
 #   db-conn --env prod|stg|test|local ...         # shorthand for <env>-postgres-db
 #
 # Examples:
-#   db-conn prod-postgres-db iamdb "SELECT id, username FROM users LIMIT 5"
-#   db-conn --env stg tables iamdb
+#   db-conn prod-postgres-db mydb "SELECT id, username FROM users LIMIT 5"
+#   db-conn --env stg tables mydb
 #   db-conn asset-mysql-db assetdb "SELECT COUNT(*) FROM assets" --csv
-#   db-conn prod-postgres-db --role ro iamdb "SELECT ..."
+#   db-conn prod-postgres-db --role ro mydb "SELECT ..."
 
 set -euo pipefail
 
