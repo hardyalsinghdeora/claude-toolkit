@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+# csession — task-level index and manager for Claude Code sessions.
+#
+# Not a log viewer: it indexes WHAT you worked on (task titles, prompts,
+# projects, files touched) across every session transcript, so you can
+# find past work, decide "resume vs start fresh", seed a new session with
+# a compact brief instead of replaying a huge transcript, and see a
+# combined work journal — all token-light.
+#
+# Reads ~/.claude/projects/<project>/<session-id>.jsonl transcripts
+# (read-only except `prune --apply`). Index is incremental (mtime-based).
+#
+# Storage:
+#   ~/.claude/session-index/index.json      the session index
+#   ~/.claude/session-index/logs/csession.log
+#
+# Usage:
+#   csession <query>              # find past sessions by task/topic
+#   csession list [-n 15]         # recent sessions: when, project, task, size
+#   csession show <id-prefix>     # one session's tasks, prompts, files touched
+#   csession brief <id-prefix>    # compact digest to paste into a NEW session
+#                                 # (continue old work without resuming a huge
+#                                 # transcript — far fewer tokens)
+#   csession suggest "<task>"     # recommend: resume an existing session or
+#                                 # start new, with the exact command to run
+#   csession journal [--days 7]   # combined what-I-worked-on journal
+#   csession prune [--days 45] [--apply]  # stale/empty sessions; dry-run
+#                                 # unless --apply (removes them from resume
+#                                 # history and frees disk)
+#   csession build                # force full re-index
+#
+# Options: --limit N (25), --project <substr>, --json
+#
+# Resume-vs-new logic in `suggest`: resuming replays the whole transcript
+# into context, so it is only recommended for related sessions under ~60k
+# tokens; bigger related sessions get "start new + csession brief" instead.
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+VERSION = "1.0.0"
+PROJECTS = Path.home() / ".claude" / "projects"
+BASE_DIR = Path.home() / ".claude" / "session-index"
+INDEX_FILE = BASE_DIR / "index.json"
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "csession.log"
+RESUME_TOKEN_LIMIT = 60000
+MAX_PROMPTS = 40
+MAX_FILES = 30
+
+
+def log(msg):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > 256 * 1024:
+        LOG_FILE.write_text("\n".join(LOG_FILE.read_text().splitlines()[-200:]) + "\n")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+
+
+def decode_project(dirname):
+    return dirname.replace("-", "/").replace("/Users/you", "/Users/you")
+
+
+def clean_text(c):
+    """Message content -> plain text, or None if not a real user prompt."""
+    if isinstance(c, list):
+        c = " ".join(b.get("text", "") for b in c
+                     if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(c, str):
+        return None
+    s = c.strip()
+    if (not s or s.startswith("<") or s.startswith("Caveat:")
+            or "<command-name>" in s or "<local-command-stdout>" in s
+            or "<system-reminder>" in s):
+        return None
+    return re.sub(r"\s+", " ", s)
+
+
+def parse_session(path):
+    rec = {"project": decode_project(path.parent.name), "title": None,
+           "cwd": None, "branch": None, "start": None, "end": None,
+           "prompts": [], "summaries": [], "files": [], "n_assistant": 0,
+           "bytes": path.stat().st_size, "mtime": path.stat().st_mtime}
+    files = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                t = d.get("type")
+                ts = d.get("timestamp")
+                if ts:
+                    rec["start"] = rec["start"] or ts
+                    rec["end"] = ts
+                if t == "ai-title":
+                    rec["title"] = d.get("aiTitle") or rec["title"]
+                elif t == "summary":
+                    s = d.get("summary")
+                    if s:
+                        rec["summaries"].append(s[:300])
+                elif t == "user" and not d.get("isSidechain"):
+                    rec["cwd"] = rec["cwd"] or d.get("cwd")
+                    rec["branch"] = rec["branch"] or d.get("gitBranch")
+                    s = clean_text(d.get("message", {}).get("content"))
+                    if s and len(rec["prompts"]) < MAX_PROMPTS:
+                        rec["prompts"].append(s[:300])
+                elif t == "assistant" and not d.get("isSidechain"):
+                    rec["n_assistant"] += 1
+                    content = d.get("message", {}).get("content")
+                    if isinstance(content, list):
+                        for b in content:
+                            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                                    and b.get("name") in ("Edit", "Write", "NotebookEdit")):
+                                fp = (b.get("input") or {}).get("file_path")
+                                if fp and fp not in files:
+                                    files.append(fp)
+    except OSError:
+        pass
+    rec["files"] = files[:MAX_FILES]
+    return rec
+
+
+def build_index(full=False):
+    t0 = time.time()
+    idx = {}
+    if INDEX_FILE.exists() and not full:
+        try:
+            idx = json.loads(INDEX_FILE.read_text())
+        except ValueError:
+            idx = {}
+    seen, changed = set(), 0
+    for path in PROJECTS.glob("*/*.jsonl"):
+        sid = path.stem
+        seen.add(sid)
+        old = idx.get(sid)
+        st = path.stat()
+        if old and old["mtime"] == st.st_mtime and old["bytes"] == st.st_size:
+            continue
+        idx[sid] = parse_session(path)
+        idx[sid]["path"] = str(path)
+        changed += 1
+    removed = [k for k in idx if k not in seen]
+    for k in removed:
+        del idx[k]
+    if changed or removed or full:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        INDEX_FILE.write_text(json.dumps(idx, separators=(",", ":")))
+        log(f"index: {len(idx)} sessions ({changed} parsed, {len(removed)} removed, "
+            f"{time.time() - t0:.1f}s)")
+    return idx
+
+
+def tokens_of(rec):
+    return rec["bytes"] // 4
+
+
+def when(rec):
+    return (rec.get("start") or "")[:16].replace("T", " ")
+
+
+def short_project(rec):
+    p = rec["project"]
+    return p.rsplit("/", 1)[-1] or p
+
+
+def label(rec):
+    return rec.get("title") or (rec["prompts"][0][:60] if rec["prompts"] else "(empty)")
+
+
+def fmt_row(sid, rec):
+    return (f"{when(rec)}  {sid[:8]}  {short_project(rec):<24.24}  "
+            f"~{tokens_of(rec) // 1000}k tok  {label(rec)[:60]}")
+
+
+def sorted_sessions(idx):
+    return sorted(idx.items(), key=lambda kv: kv[1].get("start") or "", reverse=True)
+
+
+def match_session(sid, idx):
+    hits = [k for k in idx if k.startswith(sid)]
+    if not hits:
+        sys.exit(f"no session starting with '{sid}' — run 'csession list'")
+    if len(hits) > 1:
+        sys.exit(f"ambiguous prefix '{sid}': {', '.join(h[:12] for h in hits[:5])}")
+    return hits[0]
+
+
+def score_session(words, rec):
+    text_title = (rec.get("title") or "").lower()
+    text_sum = " ".join(rec["summaries"]).lower()
+    text_pr = " ".join(rec["prompts"]).lower()
+    text_files = " ".join(rec["files"]).lower()
+    sc = 0
+    for w in words:
+        if w in text_title:
+            sc += 3
+        if w in text_sum:
+            sc += 2
+        if w in text_pr:
+            sc += 1
+        if w in text_files:
+            sc += 1
+    return sc
+
+
+def query_words(q):
+    return [w for w in re.findall(r"[a-z0-9_-]+", q.lower()) if len(w) > 2]
+
+
+def cmd_search(idx, query, limit, as_json):
+    words = query_words(query)
+    scored = [(score_session(words, r), sid, r) for sid, r in idx.items()]
+    scored = sorted([s for s in scored if s[0] > 0],
+                    key=lambda s: (-s[0], s[2].get("start") or ""), )
+    if as_json:
+        print(json.dumps([{"id": sid, "score": sc, "project": r["project"],
+                           "title": label(r), "start": r.get("start"),
+                           "tokens": tokens_of(r)} for sc, sid, r in scored[:limit]]))
+        return
+    if not scored:
+        print(f"no sessions matching '{query}' ({len(idx)} indexed)")
+        return
+    for sc, sid, rec in scored[:limit]:
+        print(fmt_row(sid, rec))
+    if len(scored) > limit:
+        print(f"… +{len(scored) - limit} more (raise with --limit)")
+
+
+def cmd_list(idx, limit, project):
+    rows = sorted_sessions(idx)
+    if project:
+        rows = [(s, r) for s, r in rows if project.lower() in r["project"].lower()]
+    for sid, rec in rows[:limit]:
+        print(fmt_row(sid, rec))
+    if not rows:
+        print("no sessions indexed")
+
+
+def cmd_show(idx, sid):
+    sid = match_session(sid, idx)
+    rec = idx[sid]
+    print(f"session:  {sid}")
+    print(f"title:    {label(rec)}")
+    print(f"project:  {rec['project']}   branch: {rec.get('branch') or '-'}")
+    print(f"when:     {when(rec)} → {(rec.get('end') or '')[:16].replace('T', ' ')}")
+    print(f"size:     ~{tokens_of(rec) // 1000}k tokens ({rec['bytes']:,} bytes), "
+          f"{len(rec['prompts'])} prompts, {rec['n_assistant']} replies")
+    if rec["prompts"]:
+        print("tasks asked:")
+        for p in rec["prompts"]:
+            print(f"  - {p[:150]}")
+    if rec["files"]:
+        print("files edited:")
+        for f in rec["files"]:
+            print(f"  - {f}")
+    print(f"resume:   claude --resume {sid}")
+
+
+def cmd_brief(idx, sid):
+    sid = match_session(sid, idx)
+    rec = idx[sid]
+    print(f"# Context brief from session {sid[:8]} ({when(rec)})")
+    print(f"Project: {rec['project']} (branch {rec.get('branch') or '?'})")
+    if rec.get("title"):
+        print(f"Topic: {rec['title']}")
+    for s in rec["summaries"]:
+        print(f"Summary: {s}")
+    if rec["prompts"]:
+        print("Work requested, in order:")
+        for p in rec["prompts"]:
+            print(f"  {p[:200]}")
+    if rec["files"]:
+        print("Files created/edited: " + ", ".join(rec["files"]))
+    print("\n(paste this into a new session to continue this work without "
+          f"resuming the full ~{tokens_of(rec) // 1000}k-token transcript)")
+
+
+def cmd_suggest(idx, task, limit):
+    words = query_words(task)
+    scored = sorted([(score_session(words, r), sid, r) for sid, r in idx.items()],
+                    key=lambda s: (-s[0], s[2].get("start") or ""))
+    related = [s for s in scored if s[0] >= max(2, len(words))]
+    print(f"task: {task}\n")
+    if not related:
+        print("recommendation: START NEW session — no related past session found.")
+        print("  claude")
+        return
+    for sc, sid, rec in related[:3]:
+        print(f"  related: {fmt_row(sid, rec)}  (score {sc})")
+    sc, sid, rec = related[0]
+    tok = tokens_of(rec)
+    days_old = 999
+    if rec.get("end"):
+        try:
+            days_old = (datetime.now() - datetime.fromisoformat(
+                rec["end"][:19])).days
+        except ValueError:
+            pass
+    print()
+    if tok <= RESUME_TOKEN_LIMIT and days_old <= 14:
+        print(f"recommendation: RESUME — same topic, small transcript (~{tok // 1000}k tokens), recent.")
+        print(f"  claude --resume {sid}")
+    else:
+        why = f"~{tok // 1000}k-token transcript" if tok > RESUME_TOKEN_LIMIT else f"{days_old} days old"
+        print(f"recommendation: START NEW, seeded with a brief — related session found but {why}; "
+              "resuming would replay it all into context.")
+        print(f"  csession brief {sid[:8]} | pbcopy   # then paste into:  claude")
+
+
+def cmd_journal(idx, days):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = [(s, r) for s, r in sorted_sessions(idx)
+            if (r.get("start") or "") >= cutoff and r["prompts"]]
+    if not rows:
+        print(f"no work in the last {days} days")
+        return
+    day = None
+    total_tok = 0
+    for sid, rec in rows:
+        d = (rec.get("start") or "")[:10]
+        if d != day:
+            day = d
+            print(f"\n{d}")
+        total_tok += tokens_of(rec)
+        print(f"  {(rec.get('start') or '')[11:16]}  {short_project(rec):<22.22} "
+              f"{label(rec)[:70]}  ({len(rec['prompts'])} tasks, ~{tokens_of(rec) // 1000}k tok)")
+    print(f"\n{len(rows)} sessions, ~{total_tok // 1000}k transcript tokens in {days} days")
+
+
+def cmd_prune(idx, days, apply):
+    cutoff = time.time() - days * 86400
+    cands = []
+    for sid, rec in sorted_sessions(idx):
+        empty = not rec["prompts"]
+        old = rec["mtime"] < cutoff
+        if empty or old:
+            cands.append((sid, rec, "empty" if empty else f">{days}d old"))
+    if not cands:
+        print("nothing to prune")
+        return
+    total = sum(r["bytes"] for _, r, _ in cands)
+    for sid, rec, why in cands:
+        print(f"{fmt_row(sid, rec)}  [{why}]")
+    print(f"\n{len(cands)} session(s), {total / 1024 / 1024:.1f} MB", end=" ")
+    if not apply:
+        print("— dry run. Re-run with --apply to delete "
+              "(removes them from `claude --resume` history).")
+        return
+    removed = 0
+    for sid, rec, _ in cands:
+        p = Path(rec["path"])
+        if p.exists() and p.suffix == ".jsonl":
+            p.unlink()
+            removed += 1
+    log(f"prune: deleted {removed} sessions, {total / 1024 / 1024:.1f} MB")
+    print(f"deleted ({removed} files).")
+    build_index(full=True)
+
+
+def main():
+    args = sys.argv[1:]
+    opts = {"limit": 25, "json": False, "project": None, "days": None, "apply": False}
+    pos = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-n", "--limit"):
+            opts["limit"] = int(args[i + 1]); i += 2
+        elif a == "--project":
+            opts["project"] = args[i + 1]; i += 2
+        elif a == "--days":
+            opts["days"] = int(args[i + 1]); i += 2
+        elif a == "--apply":
+            opts["apply"] = True; i += 1
+        elif a == "--json":
+            opts["json"] = True; i += 1
+        elif a in ("-h", "--help", "help"):
+            print(Path(__file__).read_text().split("\n\nimport")[0]
+                  .replace("#!/usr/bin/env python3\n", "").replace("# ", "").replace("#", ""))
+            return
+        elif a in ("-v", "--version", "version"):
+            print(f"csession {VERSION}")
+            return
+        else:
+            pos.append(a); i += 1
+
+    if not pos:
+        sys.exit("usage: csession <query> | list | show <id> | brief <id> | "
+                 "suggest \"<task>\" | journal | prune | build  (see --help)")
+
+    idx = build_index(full=(pos[0] == "build"))
+    if pos[0] == "build":
+        print(f"csession: {len(idx)} sessions indexed", file=sys.stderr)
+        return
+    if pos[0] == "list":
+        return cmd_list(idx, opts["limit"], opts["project"])
+    if pos[0] == "show" and len(pos) > 1:
+        return cmd_show(idx, pos[1])
+    if pos[0] == "brief" and len(pos) > 1:
+        return cmd_brief(idx, pos[1])
+    if pos[0] == "suggest" and len(pos) > 1:
+        return cmd_suggest(idx, " ".join(pos[1:]), opts["limit"])
+    if pos[0] == "journal":
+        return cmd_journal(idx, opts["days"] or 7)
+    if pos[0] == "prune":
+        return cmd_prune(idx, opts["days"] or 45, opts["apply"])
+    return cmd_search(idx, " ".join(pos), opts["limit"], opts["json"])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)

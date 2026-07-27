@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# squeeze — compress verbose command output before it enters an AI session
+# transcript, to manage token utilization. Dependency-free Python 3.
+#
+# What it does (text mode, all automatic):
+#   - strips ANSI color/escape codes
+#   - truncates very long lines (--width)
+#   - collapses runs of blank lines and consecutive duplicate lines
+#   - when over --max-lines, keeps the head and tail and elides the middle,
+#     but preserves lines matching --keep (errors/failures by default),
+#     shown with their original line numbers
+#   - enforces a final --max-bytes cap
+#   - prints a savings report to stderr (bytes + estimated tokens)
+#
+# JSON mode (--json): compacts whitespace, samples long arrays (first
+# --json-items, then "+N more"), truncates long strings. Falls back to text
+# mode if the input is not valid JSON.
+#
+# Usage:
+#   <command> | squeeze [options]          # pipe mode
+#   squeeze [options] -- <command> [args]  # wrapper mode: captures stdout+stderr,
+#                                          # preserves the command's exit code
+# Options:
+#   -n, --max-lines N   max lines kept (default 200)
+#   -b, --max-bytes N   final byte cap (default 16000, ~4k tokens)
+#   --head N / --tail N head/tail split when eliding (default 60%/40%)
+#   -w, --width N       truncate lines longer than N chars (default 320)
+#   -k, --keep REGEX    always keep matching lines from the elided middle
+#                       (default: errors/failures/warnings; '' disables)
+#   --keep-max N        cap on kept-from-elided lines (default 30)
+#   --json              JSON compaction mode
+#   --json-items N      array items kept per array in --json mode (default 5)
+#   -q, --quiet         no savings report on stderr
+#
+# Examples:
+#   npm test 2>&1 | squeeze
+#   squeeze -- ./gradlew build
+#   db-conn prod-postgres-db mydb -f big-query.sql | squeeze -n 100
+#   curl -s https://api.example.com/things | squeeze --json
+#   squeeze -k 'FAILED|AssertionError' -- pytest -v
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+VERSION = "1.0.0"
+
+DEFAULT_KEEP = r"(?i)\b(error|fatal|fail(ed|ure)?s?|exception|traceback|panic|warn(ing)?|denied|refused|timed?[ -]?out|not found)\b"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\r(?!\n)")
+
+
+def clip(line, width):
+    if width and len(line) > width:
+        return line[:width] + f" …(+{len(line) - width} chars)"
+    return line
+
+
+def collapse(lines):
+    """Collapse blank-line runs and consecutive duplicate lines."""
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        j = i
+        while j < n and lines[j] == line:
+            j += 1
+        run = j - i
+        if line.strip() == "":
+            if out and out[-1] != "":
+                out.append("")
+        elif run > 2:
+            out.append(line)
+            out.append(f"    ··· line repeated {run}× ···")
+        else:
+            out.extend([line] * run)
+        i = j
+    return out
+
+
+def elide(lines, head_n, tail_n, keep_re, keep_max):
+    if len(lines) <= head_n + tail_n + 2:
+        return lines
+    head, tail = lines[:head_n], lines[-tail_n:] if tail_n else []
+    middle = lines[head_n:len(lines) - tail_n]
+    kept = []
+    if keep_re:
+        for off, line in enumerate(middle):
+            if keep_re.search(line):
+                kept.append(f"  L{head_n + off + 1}: {line.strip()}")
+                if len(kept) >= keep_max:
+                    kept.append(f"  ··· further matches elided ···")
+                    break
+    marker = f"··· {len(middle):,} lines elided"
+    if kept:
+        marker += f" ({min(len(kept), keep_max)} matching lines kept below)"
+    marker += " ···"
+    return head + [marker] + kept + tail
+
+
+def byte_cap(text, max_bytes):
+    if len(text) <= max_bytes:
+        return text
+    head = int(max_bytes * 0.6)
+    tail = max_bytes - head
+    return (text[:head] + f"\n··· {len(text) - max_bytes:,} bytes elided ···\n"
+            + text[-tail:])
+
+
+def squeeze_text(text, args):
+    text = ANSI_RE.sub("", text)
+    lines = [clip(l.rstrip(), args.width) for l in text.splitlines()]
+    lines = collapse(lines)
+    keep_re = re.compile(args.keep) if args.keep else None
+    head_n = args.head if args.head is not None else int(args.max_lines * 0.6)
+    tail_n = args.tail if args.tail is not None else args.max_lines - head_n
+    lines = elide(lines, head_n, tail_n, keep_re, args.keep_max)
+    return byte_cap("\n".join(lines), args.max_bytes)
+
+
+def trim_json(o, items, str_max=200):
+    if isinstance(o, dict):
+        return {k: trim_json(v, items, str_max) for k, v in o.items()}
+    if isinstance(o, list):
+        if len(o) > items:
+            return [trim_json(x, items, str_max) for x in o[:items]] + [
+                f"… +{len(o) - items} more items"]
+        return [trim_json(x, items, str_max) for x in o]
+    if isinstance(o, str) and len(o) > str_max:
+        return o[:str_max] + f"…(+{len(o) - str_max} chars)"
+    return o
+
+
+def squeeze_json(text, args):
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        print("squeeze: input is not valid JSON, using text mode", file=sys.stderr)
+        return squeeze_text(text, args)
+    out = json.dumps(trim_json(data, args.json_items), separators=(",", ":"),
+                     ensure_ascii=False, default=str)
+    return byte_cap(out, args.max_bytes)
+
+
+def tokens(n_bytes):
+    return n_bytes / 4  # rough heuristic: ~4 chars per token
+
+
+def fmt_tokens(n_bytes):
+    t = tokens(n_bytes)
+    return f"{t / 1000:.1f}k" if t >= 1000 else f"{t:.0f}"
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="squeeze", add_help=True,
+        description="Compress verbose command output to save tokens in AI sessions.")
+    p.add_argument("-n", "--max-lines", type=int, default=200)
+    p.add_argument("-b", "--max-bytes", type=int, default=16000)
+    p.add_argument("--head", type=int, default=None)
+    p.add_argument("--tail", type=int, default=None)
+    p.add_argument("-w", "--width", type=int, default=320)
+    p.add_argument("-k", "--keep", default=DEFAULT_KEEP,
+                   help="regex of lines to keep from the elided middle ('' disables)")
+    p.add_argument("--keep-max", type=int, default=30)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--json-items", type=int, default=5)
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--version", action="version", version=f"squeeze {VERSION}")
+    p.add_argument("cmd", nargs=argparse.REMAINDER,
+                   help="-- command [args…] to run and compress (stdout+stderr)")
+    args = p.parse_args()
+
+    code = 0
+    if args.cmd:
+        cmd = args.cmd[1:] if args.cmd[0] == "--" else args.cmd
+        if not cmd:
+            p.error("no command given after --")
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        raw = proc.stdout.decode("utf-8", "replace")
+        code = proc.returncode
+    else:
+        if sys.stdin.isatty():
+            p.print_help()
+            return 0
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+
+    out = squeeze_json(raw, args) if args.json else squeeze_text(raw, args)
+    sys.stdout.write(out)
+    if out and not out.endswith("\n"):
+        sys.stdout.write("\n")
+
+    if not args.quiet:
+        saved = 100 * (1 - len(out) / len(raw)) if raw else 0
+        print(f"squeeze: {len(raw):,} → {len(out):,} bytes "
+              f"(≈{fmt_tokens(len(raw))} → ≈{fmt_tokens(len(out))} tokens, "
+              f"{saved:.0f}% saved)", file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)

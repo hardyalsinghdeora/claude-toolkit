@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+# dbindex — schema index for every claude-vault DB connection, so "which
+# table/column holds X" is answered offline in milliseconds instead of a
+# live query round-trip (and in few tokens instead of a schema dump).
+#
+# Crawls via db-conn (credentials stay in the macOS Keychain; no password
+# or host is ever stored here). The index holds only metadata: entry name,
+# database, schema.table, column names/types.
+#
+# Storage:
+#   ~/.claude/db-index/indexes/<entry>.json   one JSON per vault connection
+#   ~/.claude/db-index/logs/dbindex.log       crawl log (auto-rotated)
+#
+# Usage:
+#   dbindex <query>               # search tables + columns across all indexes
+#   dbindex table <name>          # matching tables WITH their column lists
+#   dbindex build [entry ...]     # crawl schemas (default: every db-conn entry)
+#   dbindex build prod-postgres-db --db coredb   # limit to one database
+#   dbindex list                  # indexed connections + freshness
+#   dbindex status                # same, with per-database table counts
+#   dbindex prune                 # drop indexes for entries gone from the vault
+#
+# Options:
+#   --limit N    max results (default 25)
+#   --json       machine-readable output
+#   --db D       (build) crawl only this database
+#
+# Search is fully offline — no VPN or DB connection needed. Re-run
+# `dbindex build` after migrations to refresh (schemas change rarely).
+
+import csv
+import io
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+BASE_DIR = Path.home() / ".claude" / "db-index"
+INDEX_DIR = BASE_DIR / "indexes"
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "dbindex.log"
+LOG_MAX_BYTES = 256 * 1024
+
+SKIP_DATABASES = {"postgres", "rdsadmin", "template0", "template1",
+                  "information_schema", "mysql", "performance_schema", "sys"}
+
+COLUMNS_SQL = ("SELECT table_schema, table_name, column_name, data_type "
+               "FROM information_schema.columns "
+               "WHERE table_schema NOT IN ('pg_catalog','information_schema',"
+               "'mysql','performance_schema','sys') "
+               "ORDER BY table_schema, table_name, ordinal_position")
+
+
+def log(msg):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+        tail = LOG_FILE.read_text().splitlines()[-200:]
+        LOG_FILE.write_text("\n".join(tail) + "\n")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+
+
+def sh(args, timeout=60):
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout, r.stderr.strip()
+
+
+def vault_entries():
+    code, out, err = sh(["db-conn", "list"])
+    if code != 0:
+        sys.exit(f"dbindex: 'db-conn list' failed: {err}")
+    names = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "json":
+            names.append(parts[0])
+    return names
+
+
+def engine_of(entry):
+    _, eng, _ = sh(["claude-vault", "get", entry, "--field", "engine"])
+    eng = eng.strip()
+    if eng in ("postgres", "mysql"):
+        return eng
+    _, port, _ = sh(["claude-vault", "get", entry, "--field", "port"])
+    return "mysql" if port.strip() == "3306" else "postgres"
+
+
+def crawl_columns(entry, db):
+    """Return {schema.table: [[col, type], ...]} for one database."""
+    code, out, err = sh(["db-conn", entry, db, COLUMNS_SQL, "--csv"], timeout=120)
+    if code != 0:
+        raise RuntimeError(err or f"query failed for {db}")
+    tables = {}
+    rows = list(csv.reader(io.StringIO(out)))
+    for row in rows[1:]:  # skip header
+        if len(row) != 4:
+            continue
+        schema, table, col, typ = row
+        tables.setdefault(f"{schema}.{table}", []).append([col, typ])
+    return tables
+
+
+def cmd_build(entries, only_db):
+    if not entries:
+        entries = vault_entries()
+    for entry in entries:
+        t0 = time.time()
+        engine = engine_of(entry)
+        code, out, err = sh(["db-conn", entry, "databases"], timeout=30)
+        if code != 0:
+            print(f"{entry}: SKIPPED — {err.splitlines()[0] if err else 'unreachable'}",
+                  file=sys.stderr)
+            log(f"build {entry}: skipped ({err.splitlines()[0] if err else 'unreachable'})")
+            continue
+        dbs = [d.strip() for d in out.splitlines()
+               if d.strip() and d.strip() not in SKIP_DATABASES]
+        if only_db:
+            dbs = [d for d in dbs if d == only_db]
+        idx = {"entry": entry, "engine": engine, "updated": None, "databases": {}}
+        old = load_one(entry)
+        if old:  # keep previously crawled DBs when limiting with --db
+            idx["databases"] = old.get("databases", {})
+        for db in dbs:
+            try:
+                tables = crawl_columns(entry, db)
+                if engine == "mysql":
+                    # one mysql crawl sees every schema: split by schema=database
+                    by_db = {}
+                    for st, cols in tables.items():
+                        schema, table = st.split(".", 1)
+                        by_db.setdefault(schema, {})[table] = cols
+                    idx["databases"].update(by_db)
+                    break
+                idx["databases"][db] = tables
+            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                print(f"{entry}/{db}: skipped ({str(e).splitlines()[0]})", file=sys.stderr)
+        idx["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        (INDEX_DIR / f"{entry}.json").write_text(json.dumps(idx, separators=(",", ":")))
+        nt = sum(len(t) for t in idx["databases"].values())
+        nc = sum(len(c) for t in idx["databases"].values() for c in t.values())
+        msg = (f"build {entry}: {len(idx['databases'])} databases, {nt:,} tables, "
+               f"{nc:,} columns, {time.time() - t0:.1f}s")
+        print(f"dbindex: {msg}", file=sys.stderr)
+        log(msg)
+
+
+def load_one(entry):
+    p = INDEX_DIR / f"{entry}.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except ValueError:
+            pass
+    return None
+
+
+def load_all():
+    out = []
+    for p in sorted(INDEX_DIR.glob("*.json")) if INDEX_DIR.exists() else []:
+        try:
+            out.append(json.loads(p.read_text()))
+        except ValueError:
+            continue
+    return out
+
+
+def score(q, name):
+    n = name.lower()
+    if n == q:
+        return 0
+    if n.startswith(q):
+        return 1
+    if q in n:
+        return 2
+    return None
+
+
+def search(query):
+    """Yield (score, entry, db, schema_table, column, type)."""
+    q = query.lower()
+    for idx in load_all():
+        for db, tables in idx["databases"].items():
+            for st, cols in tables.items():
+                sc = score(q, st.split(".", 1)[-1])
+                if sc is None:
+                    sc = score(q, st)
+                if sc is not None:
+                    yield (sc, idx["entry"], db, st, None, f"{len(cols)} cols")
+                for col, typ in cols:
+                    csc = score(q, col)
+                    if csc is not None:
+                        yield (csc + 3, idx["entry"], db, st, col, typ)
+
+
+def cmd_search(query, limit, as_json):
+    hits = sorted(search(query), key=lambda h: (h[0], h[1], h[3], h[4] or ""))
+    if as_json:
+        print(json.dumps([{"entry": h[1], "database": h[2], "table": h[3],
+                           "column": h[4], "type": h[5]} for h in hits[:limit]]))
+        return
+    if not hits:
+        n = sum(len(t) for i in load_all() for t in i["databases"].values())
+        print(f"no matches for '{query}' ({n:,} tables indexed) — "
+              "run 'dbindex build' if the schema is new")
+        return
+    for sc, entry, db, st, col, typ in hits[:limit]:
+        loc = f"{entry}/{db}"
+        if col:
+            print(f"{loc}  {st}.{col}  {typ}")
+        else:
+            print(f"{loc}  {st}  ({typ})")
+    if len(hits) > limit:
+        print(f"… +{len(hits) - limit} more (raise with --limit)")
+
+
+def cmd_table(name, limit):
+    q = name.lower()
+    shown = 0
+    for idx in load_all():
+        for db, tables in idx["databases"].items():
+            for st, cols in tables.items():
+                if score(q, st.split(".", 1)[-1]) is None:
+                    continue
+                print(f"{idx['entry']}/{db}  {st}")
+                for col, typ in cols:
+                    print(f"    {col}  {typ}")
+                shown += 1
+                if shown >= max(3, limit // 5):
+                    print("… more tables match — narrow the name")
+                    return
+    if not shown:
+        print(f"no table matching '{name}' — try 'dbindex {name}' for a wider search")
+
+
+def cmd_list(verbose=False):
+    idxs = load_all()
+    if not idxs:
+        print("No schema indexes yet — run 'dbindex build'.")
+        return
+    for idx in idxs:
+        nt = sum(len(t) for t in idx["databases"].values())
+        print(f"{idx['entry']}  [{idx['engine']}, {len(idx['databases'])} databases, "
+              f"{nt:,} tables, updated {idx.get('updated', '?')}]")
+        if verbose:
+            for db, tables in sorted(idx["databases"].items()):
+                print(f"    {db}: {len(tables)} tables")
+
+
+def cmd_prune():
+    live = set(vault_entries())
+    removed = 0
+    for p in (INDEX_DIR.glob("*.json") if INDEX_DIR.exists() else []):
+        if p.stem not in live:
+            p.unlink()
+            removed += 1
+    print(f"pruned {removed} index(es)")
+
+
+def main():
+    args = sys.argv[1:]
+    opts = {"limit": 25, "json": False, "db": None}
+    pos = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--limit":
+            opts["limit"] = int(args[i + 1]); i += 2
+        elif a == "--db":
+            opts["db"] = args[i + 1]; i += 2
+        elif a == "--json":
+            opts["json"] = True; i += 1
+        elif a in ("-h", "--help", "help"):
+            print(Path(__file__).read_text().split("\n\nimport")[0]
+                  .replace("#!/usr/bin/env python3\n", "").replace("# ", "").replace("#", ""))
+            return
+        elif a in ("-v", "--version", "version"):
+            print(f"dbindex {VERSION}")
+            return
+        else:
+            pos.append(a); i += 1
+
+    if not pos:
+        sys.exit("usage: dbindex <query> | table <name> | build [entry ...] | list | status | prune  (see --help)")
+    if pos[0] == "build":
+        return cmd_build(pos[1:], opts["db"])
+    if pos[0] == "list":
+        return cmd_list()
+    if pos[0] == "status":
+        return cmd_list(verbose=True)
+    if pos[0] == "prune":
+        return cmd_prune()
+    if pos[0] == "table" and len(pos) > 1:
+        return cmd_table(" ".join(pos[1:]), opts["limit"])
+    return cmd_search(" ".join(pos), opts["limit"], opts["json"])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)

@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+# cindex — codebase symbol index for token-light code search in AI sessions.
+#
+# Auto-detects the project root (nearest .git upward from cwd, else cwd),
+# builds an index of symbols (functions/classes/etc.) and file paths on the
+# FIRST search, then answers later searches from the index, refreshing only
+# files whose mtime/size changed. Output is compact (`path:line  kind name`)
+# so a lookup costs a few dozen tokens instead of a raw grep dump.
+#
+# Storage (nothing is ever written into the project):
+#   ~/.claude/code-index/indexes/   one JSON index per project
+#   ~/.claude/code-index/logs/cindex.log   build/refresh log (auto-rotated)
+#
+# Usage:
+#   cindex <query>                # symbol + file-path search (builds index on first use)
+#   cindex file <pattern>         # file-path search only
+#   cindex grep <regex> [--ext .py]  # content grep over indexed files, capped output
+#   cindex refresh                # incremental: re-scan only files whose
+#                                 # mtime/size changed (what searches do too)
+#   cindex build                  # force full re-parse for this project
+#   cindex status                 # index info for this project
+#   cindex list                   # all indexed projects
+#   cindex prune                  # drop indexes whose project root no longer exists
+#
+# Options:
+#   --path P      project root override (default: auto-detect from cwd)
+#   --limit N     max results (default 25)
+#   --no-refresh  skip the staleness check (fastest)
+#   --json        machine-readable output
+#
+# Languages: Python, JS/TS/JSX/TSX, Go, Java, Kotlin, C#, PHP, Ruby, Rust,
+# C/C++ (types), SQL, shell. Other text files are path-indexed only.
+
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "1.3.0"
+BASE_DIR = Path.home() / ".claude" / "code-index"
+INDEX_DIR = BASE_DIR / "indexes"
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "cindex.log"
+LOG_MAX_BYTES = 512 * 1024
+MAX_FILE_BYTES = 512 * 1024
+MAX_FILES = 50000
+MAX_SYMBOLS_PER_FILE = 500
+
+IGNORE_DIRS = {".git", "node_modules", "vendor", "dist", "build", "target",
+               ".venv", "venv", "__pycache__", ".next", ".nuxt", "coverage",
+               ".idea", ".vscode", "Pods", "DerivedData", ".cache",
+               ".terraform", "bower_components", ".gradle", ".tox", ".mypy_cache"}
+
+KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "else", "elif",
+            "try", "except", "finally", "do", "with", "match", "case", "new",
+            "await", "typeof", "constructor"}
+
+def rx(p):
+    return re.compile(p)
+
+# per-extension: list of (kind, regex) — group 1 is the symbol name,
+# except kind None → group 1 is the kind, group 2 the name (SQL).
+PATTERNS = {
+    ".py": [("class", rx(r"^\s*class\s+(\w+)")),
+            ("def", rx(r"^\s*(?:async\s+)?def\s+(\w+)"))],
+    ".js": [("class", rx(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w+)")),
+            ("fn", rx(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w+)")),
+            ("fn", rx(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>")),
+            ("method", rx(r"^\s{2,}(?:static\s+)?(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{\s*$"))],
+    ".ts": [("interface", rx(r"^\s*(?:export\s+)?interface\s+(\w+)")),
+            ("type", rx(r"^\s*(?:export\s+)?type\s+(\w+)\s*=")),
+            ("enum", rx(r"^\s*(?:export\s+)?(?:const\s+)?enum\s+(\w+)"))],
+    ".go": [("fn", rx(r"^func\s+(?:\([^)]+\)\s+)?(\w+)")),
+            ("type", rx(r"^type\s+(\w+)"))],
+    ".java": [("class", rx(r"^\s*(?:public\s+|private\s+|protected\s+|static\s+|final\s+|abstract\s+)*(?:class|interface|enum|record)\s+(\w+)")),
+              ("method", rx(r"^\s+(?:public|private|protected)\s+(?:static\s+|final\s+|abstract\s+|synchronized\s+)*[\w<>\[\],.\s]+\s+(\w+)\s*\("))],
+    ".php": [("class", rx(r"^\s*(?:abstract\s+|final\s+)?(?:class|interface|trait)\s+(\w+)")),
+             ("fn", rx(r"^\s*(?:public\s+|private\s+|protected\s+|static\s+)*function\s+(\w+)"))],
+    ".rb": [("class", rx(r"^\s*(?:class|module)\s+(\w+)")),
+            ("def", rx(r"^\s*def\s+(?:self\.)?([\w?!]+)"))],
+    ".rs": [("fn", rx(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)")),
+            ("type", rx(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|mod)\s+(\w+)")),
+            ("impl", rx(r"^\s*impl(?:<[^>]*>)?\s+(\w+)"))],
+    ".c": [("type", rx(r"^\s*(?:typedef\s+)?(?:struct|enum|union)\s+(\w+)")),
+           ("macro", rx(r"^#define\s+(\w+)"))],
+    ".sql": [(None, rx(r"(?i)^\s*create\s+(?:or\s+replace\s+)?(table|view|function|procedure|trigger|index)\s+(?:if\s+not\s+exists\s+)?[`\"\[]?(\w+)"))],
+    ".sh": [("fn", rx(r"^\s*(?:function\s+)?([A-Za-z_]\w*)\s*\(\)\s*\{"))],
+}
+# extension aliases
+for src, dsts in {".js": [".jsx", ".mjs", ".cjs"], ".ts": [".tsx"],
+                  ".java": [".kt", ".cs", ".scala"], ".c": [".h", ".cpp", ".cc", ".hpp"],
+                  ".sh": [".bash", ".zsh"]}.items():
+    for d in dsts:
+        PATTERNS[d] = PATTERNS[src]
+PATTERNS[".ts"] = PATTERNS[".js"] + PATTERNS[".ts"]
+PATTERNS[".tsx"] = PATTERNS[".ts"]
+
+# path-indexed only (no symbol scan)
+PATH_ONLY_EXTS = {".md", ".json", ".yml", ".yaml", ".xml", ".html", ".css",
+                  ".scss", ".less", ".toml", ".ini", ".cfg", ".conf", ".txt",
+                  ".graphql", ".proto", ".tf", ".vue", ".svelte"}
+
+
+def find_root(override):
+    if override:
+        return Path(override).expanduser().resolve()
+    d = Path.cwd()
+    for p in [d, *d.parents]:
+        if (p / ".git").exists():
+            return p
+    return d
+
+
+def index_path(root):
+    h = hashlib.sha1(str(root).encode()).hexdigest()[:10]
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", root.name).strip("-") or "project"
+    return INDEX_DIR / f"{slug}-{h}.json"
+
+
+def load_claudeignore(root):
+    """Patterns from <root>/.claudeignore (glob per line, # comments)."""
+    p = root / ".claudeignore"
+    pats = []
+    if p.exists():
+        for line in p.read_text(errors="ignore").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                pats.append(s.rstrip("/"))
+    return pats
+
+
+def claude_ignored(rel, pats):
+    if not pats:
+        return False
+    name = Path(rel).name
+    parts = Path(rel).parts
+    for pat in pats:
+        if (fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat)
+                or any(fnmatch.fnmatch(part, pat) for part in parts)
+                or rel.startswith(pat + "/")):
+            return True
+    return False
+
+
+def list_files(root):
+    """Relative paths of indexable files, honouring .gitignore (via git
+    ls-files) and .claudeignore (task outputs/usage/logs kept out of the
+    AI-searchable index)."""
+    if (root / ".git").exists():
+        out = subprocess.run(["git", "-C", str(root), "ls-files", "-co",
+                              "--exclude-standard"],
+                             capture_output=True, text=True).stdout
+        rels = out.splitlines()
+    else:
+        if root == Path.home():
+            sys.exit("cindex: refusing to index your home directory — cd into a project or pass --path")
+        rels = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in IGNORE_DIRS and not d.startswith(".")]
+            for f in filenames:
+                rels.append(str(Path(dirpath).relative_to(root) / f))
+                if len(rels) > MAX_FILES:
+                    break
+    ci_pats = load_claudeignore(root)
+    keep = []
+    for rel in rels:
+        ext = Path(rel).suffix.lower()
+        if ext in PATTERNS or ext in PATH_ONLY_EXTS or ext == "":
+            if any(part in IGNORE_DIRS for part in Path(rel).parts):
+                continue
+            if claude_ignored(rel, ci_pats):
+                continue
+            keep.append(rel)
+    return keep[:MAX_FILES]
+
+
+def scan_file(path, st, ext):
+    rec = {"m": st.st_mtime, "s": st.st_size, "sym": []}
+    pats = PATTERNS.get(ext)
+    if not pats or st.st_size > MAX_FILE_BYTES:
+        return rec
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return rec
+    if ext == "" and not text.startswith("#!"):
+        return rec
+    if ext == "":  # extensionless script: pick patterns from the shebang
+        pats = (PATTERNS[".py"] if "python" in text[:80]
+                else PATTERNS[".sh"] if "sh" in text[:80] else None)
+        if not pats:
+            return rec
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for kind, pat in pats:
+            m = pat.match(line)
+            if m:
+                if kind is None:  # SQL: group1=kind, group2=name
+                    k, name = m.group(1).lower(), m.group(2)
+                else:
+                    k, name = kind, m.group(1)
+                if name.lower() in KEYWORDS:
+                    continue
+                rec["sym"].append([lineno, k, name])
+                break
+        if len(rec["sym"]) >= MAX_SYMBOLS_PER_FILE:
+            break
+    return rec
+
+
+def log(msg):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+        tail = LOG_FILE.read_text().splitlines()[-200:]
+        LOG_FILE.write_text("\n".join(tail) + "\n")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+
+
+def load_index(root):
+    p = index_path(root)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except ValueError:
+            pass
+    return {"root": str(root), "built": None, "files": {}}
+
+
+def save_index(root, idx):
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    p = index_path(root)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(idx, separators=(",", ":")))
+    tmp.replace(p)
+
+
+def refresh(root, idx, full=False):
+    """Sync index with disk; only changed/new files are re-scanned."""
+    t0 = time.time()
+    old = {} if full else idx.get("files", {})
+    new, changed = {}, 0
+    for rel in list_files(root):
+        fp = root / rel
+        try:
+            st = fp.stat()
+        except OSError:
+            continue
+        rec = old.get(rel)
+        if rec and rec["m"] == st.st_mtime and rec["s"] == st.st_size:
+            new[rel] = rec
+        else:
+            new[rel] = scan_file(fp, st, Path(rel).suffix.lower())
+            changed += 1
+    removed = len(old) - sum(1 for r in old if r in new)
+    first = idx.get("built") is None
+    idx["files"] = new
+    idx["built"] = idx["built"] or time.strftime("%Y-%m-%d %H:%M:%S")
+    idx["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if changed or removed or first or full:
+        save_index(root, idx)
+    if first or full:
+        nsym = sum(len(r["sym"]) for r in new.values())
+        msg = (f"build {root}: {len(new):,} files, {nsym:,} symbols, "
+               f"{time.time() - t0:.1f}s -> {index_path(root).name}")
+        print(f"cindex: indexed {len(new):,} files / {nsym:,} symbols "
+              f"in {time.time() - t0:.1f}s -> {index_path(root).name}", file=sys.stderr)
+        log(msg)
+    elif changed or removed:
+        print(f"cindex: refreshed ({changed} changed, {removed} removed)", file=sys.stderr)
+        log(f"refresh {root}: {changed} changed, {removed} removed")
+    return idx
+
+
+def score(q, name):
+    n = name.lower()
+    if n == q:
+        return 0
+    if n.startswith(q):
+        return 1
+    if q in n:
+        return 2
+    return None
+
+
+def cmd_search(root, idx, query, limit, as_json, files_only=False):
+    q = query.lower()
+    hits = []
+    if not files_only:
+        for rel, rec in idx["files"].items():
+            for lineno, kind, name in rec["sym"]:
+                sc = score(q, name)
+                if sc is not None:
+                    hits.append((sc, rel, lineno, kind, name))
+    for rel in idx["files"]:
+        sc = score(q, Path(rel).name.lower())
+        if sc is None and q in rel.lower():
+            sc = 3
+        if sc is not None:
+            hits.append((sc + (0 if files_only else 3), rel, 0, "file", Path(rel).name))
+    hits.sort(key=lambda h: (h[0], h[1], h[2]))
+    if as_json:
+        print(json.dumps([{"file": h[1], "line": h[2], "kind": h[3], "name": h[4]}
+                          for h in hits[:limit]]))
+        return
+    if not hits:
+        print(f"no matches for '{query}' ({len(idx['files']):,} files indexed) — try 'cindex grep <regex>'")
+        return
+    for sc, rel, lineno, kind, name in hits[:limit]:
+        loc = f"{rel}:{lineno}" if lineno else rel
+        print(f"{loc}  {kind} {name}" if kind != "file" else f"{loc}  (file)")
+    if len(hits) > limit:
+        print(f"… +{len(hits) - limit} more (raise with --limit)")
+
+
+def cmd_grep(root, idx, pattern, limit, ext):
+    files = [r for r in idx["files"] if not ext or r.endswith(ext)]
+    lines, total = [], 0
+    for i in range(0, len(files), 200):
+        r = subprocess.run(["grep", "-nEI", "--", pattern, *files[i:i + 200]],
+                           cwd=root, capture_output=True, text=True)
+        got = r.stdout.splitlines()
+        total += len(got)
+        if len(lines) < limit * 2:
+            lines.extend(got)
+    for l in lines[:limit]:
+        print(l if len(l) <= 200 else l[:200] + " …")
+    if total > limit:
+        print(f"… +{total - limit} more matches (narrow the regex or use --ext)")
+    elif total == 0:
+        print(f"no content matches for /{pattern}/ in {len(files):,} indexed files")
+
+
+def cmd_status(root, idx):
+    p = index_path(root)
+    nsym = sum(len(r["sym"]) for r in idx["files"].values())
+    print(f"root:    {root}")
+    print(f"index:   {p if p.exists() else '(not built yet — first search builds it)'}")
+    if p.exists():
+        print(f"files:   {len(idx['files']):,}   symbols: {nsym:,}   "
+              f"size: {p.stat().st_size / 1024:.0f} KB")
+        print(f"built:   {idx.get('built')}   updated: {idx.get('updated')}")
+
+
+def cmd_list():
+    found = sorted(INDEX_DIR.glob("*.json")) if INDEX_DIR.exists() else []
+    if not found:
+        print("No indexes yet.")
+    for p in found:
+        try:
+            idx = json.loads(p.read_text())
+        except ValueError:
+            continue
+        alive = "" if Path(idx["root"]).exists() else "  (root missing — 'cindex prune')"
+        print(f"{idx['root']}  [{len(idx['files']):,} files, updated {idx.get('updated', '?')}]{alive}")
+
+
+def cmd_prune():
+    removed = 0
+    for p in (INDEX_DIR.glob("*.json") if INDEX_DIR.exists() else []):
+        try:
+            idx = json.loads(p.read_text())
+        except ValueError:
+            p.unlink(); removed += 1; continue
+        if not Path(idx["root"]).exists():
+            p.unlink(); removed += 1
+    print(f"pruned {removed} index(es)")
+
+
+def main():
+    args = sys.argv[1:]
+    opts = {"path": None, "limit": 25, "refresh": True, "json": False, "ext": None}
+    pos = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--path":
+            opts["path"] = args[i + 1]; i += 2
+        elif a == "--limit":
+            opts["limit"] = int(args[i + 1]); i += 2
+        elif a == "--ext":
+            opts["ext"] = args[i + 1]; i += 2
+        elif a == "--no-refresh":
+            opts["refresh"] = False; i += 1
+        elif a == "--json":
+            opts["json"] = True; i += 1
+        elif a in ("-h", "--help", "help"):
+            print(Path(__file__).read_text().split("\n\n")[0].replace("#!/usr/bin/env python3\n", "").replace("# ", "").replace("#", ""))
+            return
+        elif a in ("-v", "--version", "version"):
+            print(f"cindex {VERSION}")
+            return
+        else:
+            pos.append(a); i += 1
+
+    if not pos:
+        sys.exit("usage: cindex <query> | file <pattern> | grep <regex> | build | status | list | prune  (see --help)")
+
+    if pos[0] == "list":
+        return cmd_list()
+    if pos[0] == "prune":
+        return cmd_prune()
+
+    root = find_root(opts["path"])
+    idx = load_index(root)
+
+    if pos[0] == "build":
+        refresh(root, idx, full=True)
+        return
+    if pos[0] == "refresh":
+        n_before = len(idx.get("files", {}))
+        refresh(root, idx)
+        if idx.get("built") and n_before:
+            print(f"cindex: up to date ({len(idx['files']):,} files)", file=sys.stderr)
+        return
+    if pos[0] == "status":
+        return cmd_status(root, idx)
+
+    if idx.get("built") is None or opts["refresh"]:
+        idx = refresh(root, idx)
+
+    if pos[0] == "file" and len(pos) > 1:
+        return cmd_search(root, idx, " ".join(pos[1:]), opts["limit"], opts["json"], files_only=True)
+    if pos[0] == "grep" and len(pos) > 1:
+        return cmd_grep(root, idx, " ".join(pos[1:]), opts["limit"], opts["ext"])
+    return cmd_search(root, idx, " ".join(pos), opts["limit"], opts["json"])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)

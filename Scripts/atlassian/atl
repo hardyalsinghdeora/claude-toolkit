@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+# atl — offline Jira/Confluence fetcher for token-light AI sessions.
+#
+# Replaces Atlassian MCP round-trips (schema loading + verbose JSON) with
+# direct REST calls and COMPACT output. Auth: Jira API token from claude-vault
+# (`jira-api-token`), email from vault (`jira-email`) or the built-in default.
+# Setup once:  claude-vault set jira-api-token --desc "Jira API token"
+#              (create at id.atlassian.com → Security → API tokens)
+#
+# Usage:
+#   atl jql "<JQL>" [--limit N] [--desc] [--json]   # issues, compact TSV
+#   atl sprint "<sprint name>" [--mine]             # sprint issues (JQL helper)
+#   atl version <jira-release-url>                  # fix-version name, date + issues
+#   atl user "<display name>"                       # accountId lookup
+#   atl page <confluence-url-or-page-id>            # page as plain text (capped)
+#   atl create --project NAV --type Task --summary "..." [--description "..."]
+#
+# TSV issue output: key<TAB>status<TAB>type<TAB>assignee<TAB>summary
+
+import base64
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from html import unescape
+from pathlib import Path
+
+VERSION = "1.0.0"
+SITE = "https://your-site.atlassian.net"
+DEFAULT_EMAIL = "you@example.com"
+PAGE_CHAR_CAP = 15000
+FIELDS = "summary,status,issuetype,assignee,updated,fixVersions"
+
+
+def vault(name):
+    r = subprocess.run(["claude-vault", "get", name], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def auth_header(path="/"):
+    # Scoped Atlassian tokens carry product-specific scopes, so prefer the
+    # matching entry per product; each falls back to the other.
+    order = (["confluence-token", "jira-api-token"] if path.startswith("/wiki/")
+             else ["jira-api-token", "confluence-token"])
+    token = vault(order[0]) or vault(order[1])
+    if not token:
+        sys.exit("atl: no 'jira-api-token' or 'confluence-token' in claude-vault.\n"
+                 "  create one at id.atlassian.com → Security → API tokens, then:\n"
+                 "  claude-vault set jira-api-token --desc 'Jira API token'")
+    email = vault("jira-email") or DEFAULT_EMAIL
+    b64 = base64.b64encode(f"{email}:{token}".encode()).decode()
+    return {"Authorization": f"Basic {b64}", "Accept": "application/json",
+            "Content-Type": "application/json"}
+
+
+CACHE = Path.home() / ".claude" / "atl-cache.json"
+_state = {"gateway": None, "cloudid": None}
+if CACHE.exists():
+    try:
+        _c = json.loads(CACHE.read_text())
+        _state["cloudid"] = _c.get("cloudId")
+        _state["gateway"] = _c.get("gateway")
+    except ValueError:
+        pass
+
+
+def save_cache():
+    CACHE.write_text(json.dumps({"cloudId": _state["cloudid"],
+                                 "gateway": _state["gateway"]}))
+
+
+def cloud_id():
+    if not _state["cloudid"]:
+        with urllib.request.urlopen(SITE + "/_edge/tenant_info", timeout=15) as r:
+            _state["cloudid"] = json.loads(r.read())["cloudId"]
+        save_cache()
+    return _state["cloudid"]
+
+
+def gateway_url(path):
+    # scoped API tokens only authenticate via the api.atlassian.com gateway
+    if path.startswith("/wiki/"):
+        return f"https://api.atlassian.com/ex/confluence/{cloud_id()}{path[5:]}"
+    return f"https://api.atlassian.com/ex/jira/{cloud_id()}{path}"
+
+
+def do_request(url, payload, method, path="/"):
+    req = urllib.request.Request(
+        url, headers=auth_header(path),
+        data=json.dumps(payload).encode() if payload is not None else None,
+        method=method or ("POST" if payload is not None else "GET"))
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def call(path, payload=None, method=None):
+    urls = [SITE + path, gateway_url(path)]
+    if _state["gateway"]:
+        urls = urls[1:]
+    last = None
+    for url in urls:
+        try:
+            out = do_request(url, payload, method, path)
+            gw = url.startswith("https://api.atlassian.com")
+            if gw != _state["gateway"]:
+                _state["gateway"] = gw
+                save_cache()
+            return out
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code} on {path}: {e.read().decode()[:300]}"
+            if e.code != 401:
+                break
+        except urllib.error.URLError as e:
+            last = f"cannot reach {url.split('/')[2]} ({e.reason}) — check network/VPN"
+            break
+    sys.exit(f"atl: {last}")
+
+
+def adf_text(node, out):
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            out.append(node.get("text", ""))
+        for c in node.get("content", []):
+            adf_text(c, out)
+    elif isinstance(node, list):
+        for c in node:
+            adf_text(c, out)
+
+
+def plain_adf(doc, cap=500):
+    out = []
+    adf_text(doc, out)
+    s = re.sub(r"\s+", " ", " ".join(out)).strip()
+    return s[:cap] + ("…" if len(s) > cap else "")
+
+
+def search_jql(jql, limit, want_desc=False):
+    fields = FIELDS + (",description" if want_desc else "")
+    issues, token = [], None
+    while len(issues) < limit:
+        q = {"jql": jql, "maxResults": min(100, limit - len(issues)),
+             "fields": fields.split(",")}
+        if token:
+            q["nextPageToken"] = token
+        data = call("/rest/api/3/search/jql", q)
+        issues.extend(data.get("issues", []))
+        token = data.get("nextPageToken")
+        if not token or data.get("isLast", True):
+            break
+    return issues
+
+
+def issue_row(i, want_desc=False):
+    f = i.get("fields", {})
+    row = [i.get("key", "?"),
+           (f.get("status") or {}).get("name", "?"),
+           (f.get("issuetype") or {}).get("name", "?"),
+           ((f.get("assignee") or {}).get("displayName") or "-"),
+           re.sub(r"\s+", " ", f.get("summary") or "")[:120]]
+    if want_desc and f.get("description"):
+        row.append(plain_adf(f["description"]))
+    return row
+
+
+def print_issues(issues, want_desc, as_json):
+    if as_json:
+        print(json.dumps([issue_row(i, want_desc) for i in issues]))
+        return
+    for i in issues:
+        print("\t".join(issue_row(i, want_desc)))
+    by_status = {}
+    for i in issues:
+        s = (i.get("fields", {}).get("status") or {}).get("name", "?")
+        by_status[s] = by_status.get(s, 0) + 1
+    print(f"# {len(issues)} issues: " +
+          ", ".join(f"{k}={v}" for k, v in sorted(by_status.items())), file=sys.stderr)
+
+
+def cmd_version(url, limit, as_json):
+    m = re.search(r"/projects/(\w+)/versions/(\d+)", url)
+    if url.isdigit():
+        project, vid = None, url
+    elif m:
+        project, vid = m.group(1), m.group(2)
+    else:
+        sys.exit("atl: pass a Jira release URL (…/projects/<KEY>/versions/<ID>/…) or a version id")
+    v = call(f"/rest/api/3/version/{vid}")
+    print(f"version: {v.get('name')}  released: {v.get('releaseDate') or 'unreleased'}  "
+          f"id: {vid}  project: {project or v.get('projectId')}")
+    jql = f"fixVersion = {vid} ORDER BY issuetype ASC, key ASC"
+    if project:
+        jql = f"project = {project} AND " + jql
+    print_issues(search_jql(jql, limit), False, as_json)
+
+
+def cmd_page(ref):
+    m = re.search(r"/pages/(\d+)", ref)
+    pid = m.group(1) if m else ref
+    if not pid.isdigit():
+        sys.exit("atl: pass a Confluence page URL containing /pages/<id>/ or a numeric page id")
+    data = call(f"/wiki/api/v2/pages/{pid}?body-format=storage")
+    html = ((data.get("body") or {}).get("storage") or {}).get("value", "")
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S)
+    text = re.sub(r"</(p|tr|li|h[1-6]|div)>", "\n", text)
+    text = re.sub(r"</t[dh]>", " | ", text)
+    text = unescape(re.sub(r"<[^>]+>", "", text))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text).strip()
+    print(f"# {data.get('title')}")
+    if len(text) > PAGE_CHAR_CAP:
+        print(text[:PAGE_CHAR_CAP])
+        print(f"… [{len(text) - PAGE_CHAR_CAP:,} more chars — refine what you need]")
+    else:
+        print(text)
+
+
+def cmd_user(name):
+    users = call("/rest/api/3/user/search?query=" + urllib.parse.quote(name))
+    for u in users[:10]:
+        print(f"{u.get('accountId')}\t{u.get('displayName')}\t{u.get('emailAddress', '-')}")
+    if not users:
+        print(f"no user matching '{name}'")
+
+
+def cmd_create(opts):
+    for k in ("project", "summary"):
+        if not opts.get(k):
+            sys.exit(f"atl create: --{k} is required")
+    fields = {"project": {"key": opts["project"]},
+              "issuetype": {"name": opts.get("type") or "Task"},
+              "summary": opts["summary"]}
+    if opts.get("description"):
+        fields["description"] = {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": opts["description"]}]}]}
+    data = call("/rest/api/3/issue", {"fields": fields})
+    print(f"created {data.get('key')}  {SITE}/browse/{data.get('key')}")
+
+
+def main():
+    args = sys.argv[1:]
+    opts = {"limit": 100, "json": False, "desc": False, "mine": False,
+            "project": None, "type": None, "summary": None, "description": None}
+    pos = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--limit":
+            opts["limit"] = int(args[i + 1]); i += 2
+        elif a in ("--project", "--type", "--summary", "--description"):
+            opts[a[2:]] = args[i + 1]; i += 2
+        elif a == "--json":
+            opts["json"] = True; i += 1
+        elif a == "--desc":
+            opts["desc"] = True; i += 1
+        elif a == "--mine":
+            opts["mine"] = True; i += 1
+        elif a in ("-h", "--help", "help"):
+            print(open(__file__).read().split("\n\nimport")[0]
+                  .replace("#!/usr/bin/env python3\n", "").replace("# ", "").replace("#", ""))
+            return
+        elif a in ("-v", "--version", "version"):
+            print(f"atl {VERSION}")
+            return
+        else:
+            pos.append(a); i += 1
+
+    if not pos:
+        sys.exit("usage: atl jql|sprint|version|user|page|create|whoami …  (see --help)")
+    cmd = pos[0]
+    if cmd == "whoami":
+        d = call("/rest/api/3/myself")
+        print(f"{d.get('displayName')}  {d.get('emailAddress', '-')}  {d.get('accountId')}")
+        return
+    if cmd == "jql" and len(pos) > 1:
+        print_issues(search_jql(" ".join(pos[1:]), opts["limit"], opts["desc"]),
+                     opts["desc"], opts["json"])
+    elif cmd == "sprint" and len(pos) > 1:
+        jql = f'sprint = "{pos[1]}"'
+        if opts["mine"]:
+            jql += " AND assignee = currentUser()"
+        jql += " ORDER BY status ASC, key ASC"
+        print_issues(search_jql(jql, opts["limit"], opts["desc"]), opts["desc"], opts["json"])
+    elif cmd == "version" and len(pos) > 1:
+        cmd_version(pos[1], opts["limit"], opts["json"])
+    elif cmd == "user" and len(pos) > 1:
+        cmd_user(" ".join(pos[1:]))
+    elif cmd == "page" and len(pos) > 1:
+        cmd_page(pos[1])
+    elif cmd == "create":
+        cmd_create(opts)
+    else:
+        sys.exit(f"atl: unknown or incomplete command '{cmd}' — see --help")
+
+
+if __name__ == "__main__":
+    main()

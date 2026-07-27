@@ -1,0 +1,26 @@
+# .claudeignore — paths the toolkit's index/search tools (cindex) skip, so
+# task outputs, usage data, and logs never enter an AI session's context.
+# Syntax: one pattern per line; # comments; glob (*) supported; a bare name
+# matches any path component; trailing / optional for directories.
+#
+# Note: Claude Code itself does not enforce this file — it is honored by
+# cindex (and future toolkit tools). To hard-block Claude from reading a
+# path, add a permission deny rule in .claude/settings.json.
+
+# task-specific work products (reviews, reports, dashboards, SQL dumps)
+Output/
+
+# personal workflow definitions
+Skill/
+
+# usage data & logs
+logs/
+*.log
+
+# secrets & local config
+.env
+*.env
+
+# archives & OS noise
+*.zip
+.DS_Store

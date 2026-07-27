@@ -1,0 +1,18 @@
+# --- task-specific work products: personal/company data, never for the public repo
+Output/
+Skill/
+automation/pr-dashboard-prompt.md
+
+# --- usage data & logs
+*.log
+logs/
+automation/*.log
+
+# --- secrets & local config (values belong in claude-vault, not files)
+.env
+*.env
+
+# --- OS/editor noise
+.DS_Store
+*.tmp
+*.zip

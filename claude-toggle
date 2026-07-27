@@ -16,6 +16,14 @@ Usage:
                                          # default loads MCP config ONLY;
                                          # --all also overwrites settings.json
   claude-toggle profile list
+  claude-toggle squeeze on|off|status    # toggle the global "pipe verbose output
+                                         # through squeeze" directive in ~/.claude/CLAUDE.md
+  claude-toggle cindex  on|off|status    # toggle the global "search code via the
+                                         # cindex index" directive in ~/.claude/CLAUDE.md
+  claude-toggle dbindex on|off|status    # toggle the global "look up DB schemas via
+                                         # the dbindex index" directive
+  claude-toggle csession on|off|status   # toggle the global "recover past-session
+                                         # context via csession" directive
   claude-toggle backups                  # list auto-backups
   claude-toggle backups prune [--keep N] # trim old backups (default keep 20)
   claude-toggle restore [latest|<file>]  # restore a ~/.claude.json backup (default: latest)
@@ -32,11 +40,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.4.1"
 
 HOME = Path.home()
 CLAUDE_JSON = HOME / ".claude.json"
 SETTINGS_JSON = HOME / ".claude" / "settings.json"
+GLOBAL_MD = HOME / ".claude" / "CLAUDE.md"
 STASH = HOME / ".claude" / "mcp-disabled.json"
 BACKUPS = HOME / ".claude" / "backups"
 PROFILES = HOME / ".claude" / "config-profiles"
@@ -44,7 +53,40 @@ PROFILES = HOME / ".claude" / "config-profiles"
 GLOBAL = "__global__"
 ALL = "--all"
 KEEP_BACKUPS = 20
-BACKUP_PATTERNS = ("claude.json.*", "settings.json.*")
+BACKUP_PATTERNS = ("claude.json.*", "settings.json.*", "CLAUDE.md.*")
+
+# Directive blocks toggled in ~/.claude/CLAUDE.md. Markers must never change
+# once shipped — on/off finds blocks by them. Keep blocks SHORT: this text is
+# loaded into every session's context, so it is itself a token cost.
+DIRECTIVES = {
+    "squeeze": """## squeeze — output compression
+Run potentially verbose commands (builds, tests, installs, big queries/logs) as
+`squeeze -- <cmd>` (or `<cmd> 2>&1 | squeeze`; `--json` for JSON) so output enters
+context compressed; error lines survive elision. Skip only when every line matters.""",
+    "cindex": """## cindex — code search via index
+To find functions/classes/files, run `cindex <query>` (also `file <pattern>`,
+`grep <regex>`) before raw Grep — compact path:line results, auto-built index.
+Then Read only that file:line. Fall back to Grep/Glob when cindex misses.""",
+    "dbindex": """## dbindex — DB schema lookup
+For "which database/table/column holds X": `dbindex <query>` or
+`dbindex table <name>` — offline schema index of all vault connections, no VPN.
+Use `db-conn` only for data queries; `dbindex build` after migrations.""",
+    "csession": """## csession — past-session context
+If the user references work not in this conversation: `csession <query>` then
+`csession brief <id>` for a compact digest (never read transcript .jsonl).
+"Continue or new session?" → relay `csession suggest "<task>"`. Work history →
+`csession journal`. Never `csession prune --apply` without explicit confirmation.""",
+}
+
+
+def directive_markers(name):
+    return (f"<!-- claude-toggle:{name}:start -->",
+            f"<!-- claude-toggle:{name}:end -->")
+
+
+def directive_block(name):
+    start, end = directive_markers(name)
+    return f"{start}\n{DIRECTIVES[name]}\n{end}"
 
 
 def load(path, default):
@@ -268,6 +310,39 @@ def cmd_profile(action, name=None, mode="mcp-only"):
         sys.exit("profile action must be save, load, or list")
 
 
+def cmd_directive(name, action):
+    start_m, end_m = directive_markers(name)
+    text = GLOBAL_MD.read_text() if GLOBAL_MD.exists() else ""
+    enabled = start_m in text
+    if action == "status":
+        print(f"{name} directive: {'enabled' if enabled else 'disabled'} "
+              f"({GLOBAL_MD}{'' if GLOBAL_MD.exists() else ' — file does not exist'})")
+        return
+    if action == "on":
+        if enabled:
+            print(f"{name} directive already enabled.")
+            return
+        if GLOBAL_MD.exists():
+            print(f"backup: {backup_file(GLOBAL_MD, 'CLAUDE.md')}")
+        new = text.rstrip() + ("\n\n" if text.strip() else "") + directive_block(name) + "\n"
+        GLOBAL_MD.parent.mkdir(parents=True, exist_ok=True)
+        GLOBAL_MD.write_text(new)
+        print(f"{name} directive enabled in {GLOBAL_MD}")
+    elif action == "off":
+        if not enabled:
+            print(f"{name} directive already disabled.")
+            return
+        print(f"backup: {backup_file(GLOBAL_MD, 'CLAUDE.md')}")
+        start = text.index(start_m)
+        end = text.index(end_m) + len(end_m)
+        new = (text[:start].rstrip() + "\n\n" + text[end:].lstrip()).strip()
+        GLOBAL_MD.write_text(new + "\n" if new else "")
+        print(f"{name} directive removed from {GLOBAL_MD}")
+    else:
+        sys.exit(f"usage: claude-toggle {name} on|off|status")
+    print("Takes effect in new Claude Code sessions.")
+
+
 def list_backups():
     if not BACKUPS.exists():
         return []
@@ -346,6 +421,8 @@ def main():
             mode = "settings-only"
         rest = [a for a in args[1:] if not a.startswith("--")]
         cmd_profile(rest[0], rest[1] if len(rest) > 1 else None, mode)
+    elif cmd in DIRECTIVES:
+        cmd_directive(cmd, args[1] if len(args) > 1 else "status")
     elif cmd == "backups":
         if len(args) > 1 and args[1] == "prune":
             keep = KEEP_BACKUPS
