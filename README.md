@@ -58,9 +58,13 @@ claude-toggle squeeze on|off|status               # toggle the global "compress 
                                                   # in ~/.claude/CLAUDE.md
 claude-toggle cindex on|off|status                # toggle the global "search code via
                                                   # the cindex index" directive
+claude-toggle doctor --fix                        # fix double entries (live+stash) and
+                                                  # stashed scopes for deleted projects
 claude-toggle backups                             # list auto-backups
 claude-toggle backups prune --keep 10             # trim old backups (auto-kept at 20)
 claude-toggle restore                             # roll back to the latest backup
+claude-toggle restore --mcp-only                  # graft only the MCP scopes from the backup,
+                                                  # leaving session state/OAuth untouched
 claude-toggle restore claude.json.<stamp>         # roll back to a specific one
 claude-toggle version
 ```
@@ -110,7 +114,15 @@ claude-vault test --all                  # health-check every JSON entry
 claude-vault import .env --name mydb     # .env -> one JSON entry (POSTGRES_*/DB_*/MYSQL_* auto-mapped)
 claude-vault exec mydb --prefix PG -- psql   # run with PGHOST/PGUSER/PGPASSWORD... exported;
                                              # the secret never transits the shell or transcript
+
+claude-vault set api-key --rotate-days 90    # list/get warn once the entry is older than 90d
+claude-vault desc mydb "new description"     # edit description without re-entering the secret
+claude-vault get api-key --copy --clear 30   # clipboard, auto-cleared after 30s
+claude-vault list --json                     # machine-readable metadata (no values)
+source <(claude-vault completion zsh)        # tab-complete commands + entry names
 ```
+
+`rename` and `delete` also warn when files in the toolkit (configurable via `~/.claude/vault-consumers.json`) still reference the entry name — no more silently broken scripts.
 
 **Team convention — shared DB config, per-member passwords.** Keep the connection
 config (host/port/user, *no password*) as a JSON entry, and each member's password
@@ -150,6 +162,8 @@ db-conn inventory-mysql-db inventorydb "SELECT COUNT(*) FROM items" --csv
 db-conn prod-postgres-db --user teammate2 mydb "SELECT 1"
 db-conn prod-postgres-db --role ro mydb "SELECT ..."   # view-only password
 db-conn prod-postgres-db mydb -f lookup.sql --csv > out.csv
+db-conn prod-postgres-db mydb "SELECT ..." --md      # markdown table output
+db-conn prod-postgres-db mydb "SELECT ..." --xlsx report.xlsx   # Excel file (stdlib, no deps)
 db-conn prod-postgres-db mydb "UPDATE ..." --write   # prod is READ-ONLY unless --write:
                                                      # INSERT/UPDATE/DELETE/DDL are blocked
 ```

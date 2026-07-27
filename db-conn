@@ -17,6 +17,8 @@
 #   db-conn <entry> <database> "<SQL>"            # inline SQL
 #   db-conn <entry> <database> -f query.sql       # SQL from a file
 #   db-conn <entry> <database> -f q.sql --csv     # CSV output
+#   db-conn <entry> <database> "<SQL>" --md       # markdown table output
+#   db-conn <entry> <database> "<SQL>" --xlsx out.xlsx   # Excel output (stdlib, no deps)
 #   db-conn --env prod|stg|test|local ...         # shorthand for <env>-postgres-db
 #   db-conn <prod-entry> <db> "UPDATE ..." --write  # prod is read-only unless --write
 #
@@ -34,6 +36,51 @@ vault() { claude-vault get "$@"; }
 
 tsv2csv() {
   python3 -c 'import csv,sys; w=csv.writer(sys.stdout); [w.writerow(r) for r in csv.reader(sys.stdin, dialect="excel-tab")]'
+}
+
+csv2md() {
+  python3 -c '
+import csv, sys
+rows = list(csv.reader(sys.stdin))
+if not rows:
+    sys.exit(0)
+print("| " + " | ".join(rows[0]) + " |")
+print("|" + "---|" * len(rows[0]))
+for r in rows[1:]:
+    print("| " + " | ".join(r) + " |")
+'
+}
+
+csv2xlsx() {  # csv on stdin -> minimal valid .xlsx at $1 (stdlib only)
+  python3 -c '
+import csv, sys, zipfile
+from xml.sax.saxutils import escape
+out = sys.argv[1]
+rows = list(csv.reader(sys.stdin))
+cells = lambda r: "".join(f"<c t=\"inlineStr\"><is><t>{escape(v)}</t></is></c>" for v in r)
+sheet = ("<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>"
+         + "".join(f"<row r=\"{i+1}\">{cells(r)}</row>" for i, r in enumerate(rows))
+         + "</sheetData></worksheet>")
+ct = ("<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+      "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+      "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+      "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+      "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>")
+rels = ("<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>")
+wb = ("<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+      "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+      "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>")
+wbrels = ("<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+          "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>")
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("[Content_Types].xml", ct)
+    z.writestr("_rels/.rels", rels)
+    z.writestr("xl/workbook.xml", wb)
+    z.writestr("xl/_rels/workbook.xml.rels", wbrels)
+    z.writestr("xl/worksheets/sheet1.xml", sheet)
+print(f"wrote {out} ({max(0, len(rows) - 1)} data rows)", file=sys.stderr)
+' "$1"
 }
 
 ENTRY=""
@@ -152,11 +199,13 @@ case "$cmd" in
     ;;
   *)
     db="$cmd"
-    csv=0; sql=""; file=""; write=0
+    csv=0; sql=""; file=""; write=0; md=0; xlsx=""
     i=1
     while [ $i -lt ${#POS[@]} ]; do
       case "${POS[$i]}" in
         --csv) csv=1 ;;
+        --md) md=1 ;;
+        --xlsx) i=$((i+1)); xlsx="${POS[$i]:?--xlsx needs an output file}" ;;
         --write) write=1 ;;
         -f) i=$((i+1)); file="${POS[$i]}" ;;
         *) sql="${POS[$i]}" ;;
@@ -182,18 +231,22 @@ case "$cmd" in
         ;;
     esac
     if [ "$ENGINE" = "mysql" ]; then
-      if [ -n "$file" ]; then
-        if [ "$csv" -eq 1 ]; then run_my -B "$db" < "$file" | tsv2csv
-        else run_my --table "$db" < "$file"; fi
-      else
-        if [ "$csv" -eq 1 ]; then run_my -B "$db" -e "$sql" | tsv2csv
-        else run_my --table "$db" -e "$sql"; fi
-      fi
+      run_my_csv() {
+        if [ -n "$file" ]; then run_my -B "$db" < "$file" | tsv2csv
+        else run_my -B "$db" -e "$sql" | tsv2csv; fi
+      }
+      if [ -n "$xlsx" ]; then run_my_csv | csv2xlsx "$xlsx"
+      elif [ "$md" -eq 1 ]; then run_my_csv | csv2md
+      elif [ "$csv" -eq 1 ]; then run_my_csv
+      elif [ -n "$file" ]; then run_my --table "$db" < "$file"
+      else run_my --table "$db" -e "$sql"; fi
     else
       args=()
       [ -n "$file" ] && args+=(-f "$file")
       [ -n "$sql" ] && args+=(-c "$sql")
-      if [ "$csv" -eq 1 ]; then run_pg "$db" --csv "${args[@]}"
+      if [ -n "$xlsx" ]; then run_pg "$db" --csv "${args[@]}" | csv2xlsx "$xlsx"
+      elif [ "$md" -eq 1 ]; then run_pg "$db" --csv "${args[@]}" | csv2md
+      elif [ "$csv" -eq 1 ]; then run_pg "$db" --csv "${args[@]}"
       else run_pg "$db" "${args[@]}"; fi
     fi
     ;;

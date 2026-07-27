@@ -44,7 +44,7 @@ Scan the Keychain for `claude-vault.*` service items and diff against `vault-ind
 - JSON-typed entries that fail `json.loads` → flag
 Run automatically (cheap check) at the top of `list`.
 
-### V5. Rotation metadata + staleness warnings — **P2, small**
+### V5. ~~Rotation metadata + staleness warnings~~ — **done 2026-07-27** (vault 1.4.0; `set --rotate-days N`, list/get warn when stale)
 Optional `--rotate-days N` on `set`; `list` and `get` print a warning once an entry is older than its rotation window. Would have surfaced S1 before the failed logins.
 
 ### V6. ~~`test <name>` — live credential check~~ — **done 2026-07-27** (vault 1.3.0; ok / AUTH FAILED / UNREACHABLE-with-VPN-hint, resolves per-member password entries, `--all`)
@@ -53,13 +53,13 @@ For JSON secrets that look like DB credentials (have host/user/password), attemp
 ### V7. ~~Import from `.env` / bulk add~~ — **done 2026-07-27** (vault 1.3.0; POSTGRES_*/DB_*/MYSQL_* auto-map + `--map`)
 `claude-vault import <file|-> --name core-db --map POSTGRES_HOST=host,POSTGRES_USER=user,POSTGRES_PASSWORD=password` (with sane defaults for the common `POSTGRES_*`/`DB_*`/`MYSQL_*` prefixes). Kills the paste-secrets-into-chat pattern of S6.
 
-### V8. Reference tracking / rename safety — **P2, small**
+### V8. ~~Reference tracking / rename safety~~ — **done 2026-07-27** (vault 1.4.0; rename/delete grep consumer dirs — default: the toolkit repo, configurable via ~/.claude/vault-consumers.json)
 `rename` and `delete` grep known consumer scripts (start with this repo, configurable list) for the entry name and warn: "`core-db` references `prod-code-db`". Prevents S8-style silent breakage.
 
 ### V9. ~~`exec` — inject secrets as env vars~~ — **done 2026-07-27** (vault 1.3.0; `--prefix PG` -> PGHOST/PGUSER/..., os.execvpe so the value never transits the shell)
 `claude-vault exec <name> [--prefix PG] -- psql -h ...` runs a child process with fields exported (`PGHOST/PGUSER/PGPASSWORD` mapping built in). The secret never transits the parent shell, command line, or transcript at all — stronger than `$(claude-vault get ...)` substitution.
 
-### V10. Quality-of-life — **P2, small each**
+### V10. ~~Quality-of-life~~ — **done 2026-07-27 except Touch-ID** (vault 1.4.0; `list --json`, `desc`, `--copy --clear N`, zsh completion. Touch-ID ACL gating deliberately skipped: re-adding items with `-T ""` risks locking existing entries — revisit only on concrete need)
 - `list --json` (machine-readable, for tooling and AI sessions)
 - `desc <name> "text"` — edit description without re-entering the secret
 - `get <name> --copy [--clear 30]` — clipboard with auto-clear
@@ -87,10 +87,10 @@ Removes the guess-and-check around "which profile am I on?"
 ### T4. ~~Server groups~~ — **done 2026-07-27** (toggle 1.5.0; `group set/list/delete`, `disable @work`, stored in ~/.claude/toggle-groups.json)
 Named sets in a small config file (e.g. `browser = claude-in-chrome`, `work = atlassian, zoho`): `claude-toggle disable @work`. Cheaper than full profiles when you just want to shed a category.
 
-### T5. `doctor` — consistency checks — **P2, small**
+### T5. ~~`doctor` — consistency checks~~ — **done 2026-07-27** (toggle 1.6.0; double entries, stashed scopes for deleted paths, malformed stash; `--fix`)
 Detect: same server present in both `.claude.json` and the stash (double-entry after a manual edit), stashed entries for project paths that no longer exist, malformed stash. Offer fixes.
 
-### T6. Selective restore — **P2, small**
+### T6. ~~Selective restore~~ — **done 2026-07-27** (toggle 1.6.0; `restore --mcp-only` grafts MCP scopes only)
 `restore` currently swaps the entire `.claude.json` (which also holds session state, history, OAuth). Add `--mcp-only` to graft only the `mcpServers` scopes out of the backup, leaving the rest of the live file untouched.
 
 ### T7. Per-project auto-profile via hooks — **P3, medium**
@@ -126,7 +126,7 @@ Before running psql, probe the host (`nc -z -G 3 $HOST $PORT`). On failure print
 ### C4. ~~Prod write guard~~ — **done 2026-07-27** (db-conn; entries matching *prod* block INSERT/UPDATE/DELETE/DDL unless `--write`)
 Default to blocking statements matching `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE` when `--env prod`, unless `--write` is passed. A one-line regex gate that makes the common case (read-only lookups for support requests) safe by construction.
 
-### C5. Convenience output modes — **P2, small**
+### C5. ~~Convenience output modes~~ — **done 2026-07-27** (db-conn `--md` and `--xlsx <file>`, minimal xlsx via stdlib zipfile)
 `--xlsx <file>` / `--md` output via a tiny Python helper, since query results regularly end up in Excel deliverables anyway.
 
 ---
@@ -240,7 +240,7 @@ Everything here is small, and each item prevented or would have prevented a real
 **Phase 2 — trust the vault: ✅ done 2026-07-27** — V4, V6, V7, V9, T3, T4, C4 (claude-vault 1.3.0, claude-toggle 1.5.0, db-conn write guard)
 After this, credentials are verifiable, importable without chat-pasting, and injectable without shell substitution.
 
-**Phase 3 — polish & reach (as needed):** V5, V8, V10, T5, T6, C5, then V11/T7/T8 only if a concrete need appears.
+**Phase 3 — polish & reach: ✅ done 2026-07-27** — V5, V8, V10 (minus Touch-ID), T5, T6, C5 (claude-vault 1.4.0, claude-toggle 1.6.0, db-conn output modes). V11/T7/T8 remain deliberately unbuilt — no concrete need yet.
 
 **Phase 4 — token-optimization suite hardening (added 2026-07-27):**
 1. **G3 commit the suite** (still pending — now also covers atl, skills, ignore files, docs) + **G1 doctor/install** — S10 must not happen again; everything else builds on a healthy install.

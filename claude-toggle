@@ -29,9 +29,15 @@ Usage:
                                          # the dbindex index" directive
   claude-toggle csession on|off|status   # toggle the global "recover past-session
                                          # context via csession" directive
+  claude-toggle doctor [--fix]           # consistency checks: double entries (live+stash),
+                                         # stashed scopes for deleted project paths,
+                                         # malformed stash
   claude-toggle backups                  # list auto-backups
   claude-toggle backups prune [--keep N] # trim old backups (default keep 20)
-  claude-toggle restore [latest|<file>]  # restore a ~/.claude.json backup (default: latest)
+  claude-toggle restore [latest|<file>] [--mcp-only]
+                                         # restore a ~/.claude.json backup (default: latest);
+                                         # --mcp-only grafts just the MCP scopes, leaving
+                                         # session state/OAuth in the live file untouched
 
 If neither --project nor --global is given, disable/enable acts on every
 scope where the server is found (or stashed). Changes apply to NEW Claude
@@ -45,7 +51,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 HOME = Path.home()
 CLAUDE_JSON = HOME / ".claude.json"
@@ -452,6 +458,44 @@ def cmd_directive(name, action):
     print("Takes effect in new Claude Code sessions.")
 
 
+def cmd_doctor(fix=False):
+    problems = 0
+    try:
+        stash = load(STASH, {})
+    except (json.JSONDecodeError, ValueError):
+        print(f"malformed stash file: {STASH} — fix it by hand or delete it "
+              "(disabled-server configs would be lost)")
+        return
+    cfg = load(CLAUDE_JSON, {})
+    live = {key: set(servers) for key, servers in scopes(cfg)}
+    for key in list(stash.keys()):
+        # double entry: enabled AND stashed in the same scope
+        for name in [n for n in stash[key] if n in live.get(key, set())]:
+            problems += 1
+            print(f"double entry: '{name}' is both enabled and stashed in {scope_label(key)}"
+                  + ("  -> dropping the stale stash copy" if fix else ""))
+            if fix:
+                del stash[key][name]
+        # stashed scope for a project directory that no longer exists
+        if key != GLOBAL and not Path(key).exists():
+            problems += 1
+            names = ", ".join(stash[key]) or "-"
+            print(f"stashed scope for missing project path {key} ({names})"
+                  + ("  -> pruning" if fix else ""))
+            if fix:
+                del stash[key]
+        elif key in stash and not stash[key]:
+            if fix:
+                del stash[key]
+    if problems == 0:
+        print("doctor: stash and live config are consistent.")
+    elif fix:
+        save(STASH, stash)
+        print("doctor: fixed.")
+    else:
+        print("run 'claude-toggle doctor --fix' to fix.")
+
+
 def list_backups():
     if not BACKUPS.exists():
         return []
@@ -481,7 +525,7 @@ def cmd_backups_prune(keep):
     print(f"pruned {removed} backup(s), {remaining} kept (newest {keep} per file)")
 
 
-def cmd_restore(which):
+def cmd_restore(which, mcp_only=False):
     found = list_backups()
     if not found:
         sys.exit("no backups to restore")
@@ -493,8 +537,20 @@ def cmd_restore(which):
             sys.exit(f"no backup named '{which}' — run 'claude-toggle backups'")
     # back up the current state too, so a restore is itself reversible
     print(f"pre-restore backup: {backup_claude_json()}")
-    shutil.copy2(src, CLAUDE_JSON)
-    print(f"restored ~/.claude.json from {src.name}")
+    if mcp_only:
+        backup_cfg = load(src, {})
+        cfg = load(CLAUDE_JSON, {})
+        cfg["mcpServers"] = backup_cfg.get("mcpServers", {})
+        for proj, pcfg in cfg.get("projects", {}).items():
+            pcfg.pop("mcpServers", None)
+        for proj, pcfg in backup_cfg.get("projects", {}).items():
+            if pcfg.get("mcpServers"):
+                cfg.setdefault("projects", {}).setdefault(proj, {})["mcpServers"] = pcfg["mcpServers"]
+        save(CLAUDE_JSON, cfg)
+        print(f"grafted MCP scopes from {src.name} — session state/OAuth in the live file untouched")
+    else:
+        shutil.copy2(src, CLAUDE_JSON)
+        print(f"restored ~/.claude.json from {src.name}")
     warn_if_sessions_running()
 
 
@@ -553,8 +609,11 @@ def main():
             cmd_backups_prune(keep)
         else:
             cmd_backups()
+    elif cmd == "doctor":
+        cmd_doctor(fix="--fix" in args)
     elif cmd == "restore":
-        cmd_restore(args[1] if len(args) > 1 else None)
+        which = next((a for a in args[1:] if not a.startswith("--")), None)
+        cmd_restore(which, mcp_only="--mcp-only" in args)
     else:
         sys.exit(f"unknown command '{cmd}' — run 'claude-toggle help'")
 
