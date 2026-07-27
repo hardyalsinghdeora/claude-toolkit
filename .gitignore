@@ -1,6 +1,10 @@
 # --- task-specific work products: personal/company data, never for the public repo
-Output/
-Skill/
+# (folder READMEs and the example skill are kept as reference)
+Output/*
+!Output/README.md
+Skill/*
+!Skill/README.md
+!Skill/_example/
 automation/pr-dashboard-prompt.md
 
 # --- usage data & logs
