@@ -13,6 +13,8 @@
 #
 # Usage:
 #   cindex <query>                # symbol + file-path search (builds index on first use)
+#   cindex --all <query>          # search EVERY indexed project at once
+#                                 # (a ticket id like PROJ-123 also matches branch tags)
 #   cindex file <pattern>         # file-path search only
 #   cindex grep <regex> [--ext .py]  # content grep over indexed files, capped output
 #   cindex refresh                # incremental: re-scan only files whose
@@ -41,7 +43,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BASE_DIR = Path.home() / ".claude" / "code-index"
 INDEX_DIR = BASE_DIR / "indexes"
 LOG_DIR = BASE_DIR / "logs"
@@ -260,6 +262,11 @@ def refresh(root, idx, full=False):
     removed = len(old) - sum(1 for r in old if r in new)
     first = idx.get("built") is None
     idx["files"] = new
+    branch = git_branch(root)
+    idx["branch"] = branch
+    tickets = sorted(set(TICKET_RE.findall(branch.upper())))
+    if tickets:
+        idx["tickets"] = sorted(set(idx.get("tickets", [])) | set(tickets))
     idx["built"] = idx["built"] or time.strftime("%Y-%m-%d %H:%M:%S")
     idx["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
     if changed or removed or first or full:
@@ -286,6 +293,51 @@ def score(q, name):
     if q in n:
         return 2
     return None
+
+
+def git_branch(root):
+    r = subprocess.run(["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+
+def cmd_search_all(query, limit, as_json):
+    """X1: search every project index at once (ticket ids match branch tags too)."""
+    q = query.lower()
+    hits = []
+    for p in sorted(INDEX_DIR.glob("*.json")) if INDEX_DIR.exists() else []:
+        try:
+            idx = json.loads(p.read_text())
+        except ValueError:
+            continue
+        proj = Path(idx.get("root", p.stem)).name
+        if TICKET_RE.fullmatch(query.upper()) and query.upper() in idx.get("tickets", []):
+            hits.append((0, proj, f"[branch {idx.get('branch', '?')}]", 0, "ticket", query.upper()))
+        for rel, rec in idx.get("files", {}).items():
+            for lineno, kind, name in rec.get("sym", []):
+                sc = score(q, name)
+                if sc is not None:
+                    hits.append((sc, proj, rel, lineno, kind, name))
+            sc = score(q, Path(rel).name.lower())
+            if sc is not None:
+                hits.append((sc + 3, proj, rel, 0, "file", Path(rel).name))
+    hits.sort(key=lambda h: (h[0], h[1], h[2], h[3]))
+    if as_json:
+        print(json.dumps([{"project": h[1], "file": h[2], "line": h[3],
+                           "kind": h[4], "name": h[5]} for h in hits[:limit]]))
+        return
+    if not hits:
+        n = len(list(INDEX_DIR.glob("*.json"))) if INDEX_DIR.exists() else 0
+        print(f"no matches for '{query}' across {n} project index(es)")
+        return
+    for sc, proj, rel, lineno, kind, name in hits[:limit]:
+        loc = f"{rel}:{lineno}" if lineno else rel
+        print(f"{proj}  {loc}  {kind} {name}")
+    if len(hits) > limit:
+        print(f"… +{len(hits) - limit} more (raise with --limit)")
 
 
 def cmd_search(root, idx, query, limit, as_json, files_only=False):
@@ -374,7 +426,8 @@ def cmd_prune():
 
 def main():
     args = sys.argv[1:]
-    opts = {"path": None, "limit": 25, "refresh": True, "json": False, "ext": None}
+    opts = {"path": None, "limit": 25, "refresh": True, "json": False,
+            "ext": None, "all": False}
     pos = []
     i = 0
     while i < len(args):
@@ -385,6 +438,8 @@ def main():
             opts["limit"] = int(args[i + 1]); i += 2
         elif a == "--ext":
             opts["ext"] = args[i + 1]; i += 2
+        elif a == "--all":
+            opts["all"] = True; i += 1
         elif a == "--no-refresh":
             opts["refresh"] = False; i += 1
         elif a == "--json":
@@ -405,6 +460,8 @@ def main():
         return cmd_list()
     if pos[0] == "prune":
         return cmd_prune()
+    if opts["all"] and pos[0] not in ("build", "status", "refresh"):
+        return cmd_search_all(" ".join(pos), opts["limit"], opts["json"])
 
     root = find_root(opts["path"])
     idx = load_index(root)

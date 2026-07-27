@@ -29,6 +29,9 @@ Usage:
                                          # the dbindex index" directive
   claude-toggle csession on|off|status   # toggle the global "recover past-session
                                          # context via csession" directive
+  claude-toggle <directive> refresh      # re-apply the CURRENT block text (after a
+                                         # claude-toggle upgrade changed the wording)
+  claude-toggle directives [refresh]     # all directives: off / current / outdated
   claude-toggle doctor [--fix]           # consistency checks: double entries (live+stash),
                                          # stashed scopes for deleted project paths,
                                          # malformed stash
@@ -51,7 +54,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 HOME = Path.home()
 CLAUDE_JSON = HOME / ".claude.json"
@@ -99,6 +102,17 @@ def directive_markers(name):
 def directive_block(name):
     start, end = directive_markers(name)
     return f"{start}\n{DIRECTIVES[name]}\n{end}"
+
+
+def directive_state(name, text=None):
+    """('off'|'current'|'stale') for a directive in ~/.claude/CLAUDE.md."""
+    if text is None:
+        text = GLOBAL_MD.read_text() if GLOBAL_MD.exists() else ""
+    start_m, end_m = directive_markers(name)
+    if start_m not in text:
+        return "off"
+    block = text[text.index(start_m):text.index(end_m) + len(end_m)]
+    return "current" if block.strip() == directive_block(name).strip() else "stale"
 
 
 def load(path, default):
@@ -425,13 +439,50 @@ def cmd_profile(action, name=None, mode="mcp-only"):
         sys.exit("profile action must be save, load, or list")
 
 
+def cmd_directives(action=None):
+    """Overview of every known directive (T10), optionally refreshing all (T9)."""
+    text = GLOBAL_MD.read_text() if GLOBAL_MD.exists() else ""
+    if action == "refresh":
+        for name in DIRECTIVES:
+            if directive_state(name, text) == "stale":
+                cmd_directive(name, "refresh")
+                text = GLOBAL_MD.read_text()
+        print("directives: all enabled blocks now match the current text.")
+        return
+    w = max(len(n) for n in DIRECTIVES)
+    for name in sorted(DIRECTIVES):
+        st = directive_state(name, text)
+        note = {"off": "disabled",
+                "current": "enabled (text current)",
+                "stale": "enabled (TEXT OUTDATED — run 'claude-toggle "
+                         f"{name} refresh')"}[st]
+        print(f"{name.ljust(w)}  {note}")
+
+
 def cmd_directive(name, action):
     start_m, end_m = directive_markers(name)
     text = GLOBAL_MD.read_text() if GLOBAL_MD.exists() else ""
     enabled = start_m in text
     if action == "status":
-        print(f"{name} directive: {'enabled' if enabled else 'disabled'} "
+        st = directive_state(name, text)
+        extra = {"off": "", "current": " (text current)",
+                 "stale": " — TEXT OUTDATED, run 'claude-toggle "
+                          f"{name} refresh'"}[st]
+        print(f"{name} directive: {'enabled' if enabled else 'disabled'}{extra} "
               f"({GLOBAL_MD}{'' if GLOBAL_MD.exists() else ' — file does not exist'})")
+        return
+    if action == "refresh":
+        if not enabled:
+            sys.exit(f"'{name}' directive is not enabled — use 'claude-toggle {name} on'")
+        if directive_state(name, text) == "current":
+            print(f"{name} directive already matches the current text.")
+            return
+        print(f"backup: {backup_file(GLOBAL_MD, 'CLAUDE.md')}")
+        start = text.index(start_m)
+        end = text.index(end_m) + len(end_m)
+        GLOBAL_MD.write_text(text[:start] + directive_block(name) + text[end:])
+        print(f"{name} directive text refreshed in {GLOBAL_MD}")
+        print("Takes effect in new Claude Code sessions.")
         return
     if action == "on":
         if enabled:
@@ -454,7 +505,7 @@ def cmd_directive(name, action):
         GLOBAL_MD.write_text(new + "\n" if new else "")
         print(f"{name} directive removed from {GLOBAL_MD}")
     else:
-        sys.exit(f"usage: claude-toggle {name} on|off|status")
+        sys.exit(f"usage: claude-toggle {name} on|off|status|refresh")
     print("Takes effect in new Claude Code sessions.")
 
 
@@ -596,6 +647,8 @@ def main():
             mode = "settings-only"
         rest = [a for a in args[1:] if not a.startswith("--")]
         cmd_profile(rest[0], rest[1] if len(rest) > 1 else None, mode)
+    elif cmd == "directives":
+        cmd_directives(args[1] if len(args) > 1 else None)
     elif cmd in DIRECTIVES:
         cmd_directive(cmd, args[1] if len(args) > 1 else "status")
     elif cmd == "backups":

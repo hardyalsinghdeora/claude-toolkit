@@ -14,6 +14,8 @@
 #   atl user "<display name>"                       # accountId lookup
 #   atl page <confluence-url-or-page-id>            # page as plain text (capped)
 #   atl create --project NAV --type Task --summary "..." [--description "..."]
+#                                                   [--dry-run]  # print the payload only
+#   atl whoami                                      # verify which account the token is
 #
 # TSV issue output: key<TAB>status<TAB>type<TAB>assignee<TAB>summary
 
@@ -28,7 +30,7 @@ import urllib.request
 from html import unescape
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SITE = "https://your-site.atlassian.net"
 DEFAULT_EMAIL = "you@example.com"
 PAGE_CHAR_CAP = 15000
@@ -96,7 +98,7 @@ def do_request(url, payload, method, path="/"):
         return json.loads(r.read().decode() or "{}")
 
 
-def call(path, payload=None, method=None):
+def call(path, payload=None, method=None, soft=False):
     urls = [SITE + path, gateway_url(path)]
     if _state["gateway"]:
         urls = urls[1:]
@@ -116,7 +118,28 @@ def call(path, payload=None, method=None):
         except urllib.error.URLError as e:
             last = f"cannot reach {url.split('/')[2]} ({e.reason}) — check network/VPN"
             break
+    if soft:
+        return None
     sys.exit(f"atl: {last}")
+
+
+def whoami_or_none():
+    """Identity per the API, or None when the credentials don't authenticate."""
+    d = call("/rest/api/3/myself", soft=True)
+    return d.get("displayName") if isinstance(d, dict) and d.get("accountId") else None
+
+
+def guard_empty_result(kind="issues"):
+    """Jira answers unauthenticated JQL with 200 + zero results instead of an
+    error (S13), so an empty result must be proven to be a real empty."""
+    who = whoami_or_none()
+    if who is None:
+        sys.exit("atl: 0 results AND the credentials do not authenticate — the token is\n"
+                 "  invalid, expired, or lacks scope (Jira silently returns an empty list\n"
+                 "  instead of 401). Check with 'atl whoami', then refresh the token:\n"
+                 "  claude-vault set jira-api-token --from-clipboard")
+    print(f"# 0 {kind} — authenticated as {who}, so the query genuinely matched nothing",
+          file=sys.stderr)
 
 
 def adf_text(node, out):
@@ -166,6 +189,11 @@ def issue_row(i, want_desc=False):
 
 
 def print_issues(issues, want_desc, as_json):
+    if not issues:
+        guard_empty_result("issues")
+        if as_json:
+            print("[]")
+        return
     if as_json:
         print(json.dumps([issue_row(i, want_desc) for i in issues]))
         return
@@ -204,10 +232,24 @@ def cmd_page(ref):
     data = call(f"/wiki/api/v2/pages/{pid}?body-format=storage")
     html = ((data.get("body") or {}).get("storage") or {}).get("value", "")
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S)
-    text = re.sub(r"</(p|tr|li|h[1-6]|div)>", "\n", text)
-    text = re.sub(r"</t[dh]>", " | ", text)
+    # A3: drop Confluence macro plumbing whose values otherwise concatenate into
+    # noise like "12falselistfalse"
+    text = re.sub(r"<ac:parameter\b.*?</ac:parameter>", " ", text, flags=re.S)
+    text = re.sub(r"<ac:(placeholder|layout-section|layout-cell|layout)\b.*?</ac:\1>",
+                  " ", text, flags=re.S)
+    text = re.sub(r"<ri:[^>]*/?>", " ", text)
+    text = re.sub(r"<time[^>]*datetime=\"([^\"]+)\"[^>]*/?>", r"\1", text)
+    # tables -> markdown-ish rows
+    text = re.sub(r"</t[dh]>\s*", " | ", text)
+    text = re.sub(r"<tr[^>]*>", "| ", text)
+    text = re.sub(r"</tr>", "\n", text)
+    text = re.sub(r"</(p|li|h[1-6]|div|table)>", "\n", text)
     text = unescape(re.sub(r"<[^>]+>", "", text))
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+                  "", text)                                  # macro/local ids
+    text = re.sub(r"^\s*\|\s*$", "", text, flags=re.M)      # empty table rows
+    text = re.sub(r"\|\s*\|\s*(\|\s*)+", "| ", text)         # collapse empty cells
     text = re.sub(r"\n\s*\n+", "\n", text).strip()
     print(f"# {data.get('title')}")
     if len(text) > PAGE_CHAR_CAP:
@@ -235,13 +277,20 @@ def cmd_create(opts):
     if opts.get("description"):
         fields["description"] = {"type": "doc", "version": 1, "content": [
             {"type": "paragraph", "content": [{"type": "text", "text": opts["description"]}]}]}
+    if opts.get("dry_run"):
+        who = whoami_or_none()
+        print(f"# DRY RUN — would POST /rest/api/3/issue as {who or 'UNAUTHENTICATED'}")
+        print(json.dumps({"fields": fields}, indent=2))
+        if who is None:
+            sys.exit("atl: credentials do not authenticate — creation would fail")
+        return
     data = call("/rest/api/3/issue", {"fields": fields})
     print(f"created {data.get('key')}  {SITE}/browse/{data.get('key')}")
 
 
 def main():
     args = sys.argv[1:]
-    opts = {"limit": 100, "json": False, "desc": False, "mine": False,
+    opts = {"limit": 100, "json": False, "desc": False, "mine": False, "dry_run": False,
             "project": None, "type": None, "summary": None, "description": None}
     pos = []
     i = 0
@@ -257,11 +306,14 @@ def main():
             opts["desc"] = True; i += 1
         elif a == "--mine":
             opts["mine"] = True; i += 1
+        elif a == "--dry-run":
+            opts["dry_run"] = True; i += 1
         elif a in ("-h", "--help", "help"):
             print(open(__file__).read().split("\n\nimport")[0]
                   .replace("#!/usr/bin/env python3\n", "").replace("# ", "").replace("#", ""))
             return
-        elif a in ("-v", "--version", "version"):
+        elif a in ("-v", "--version"):
+            # NB: bare "version" is the fix-version subcommand, not this flag
             print(f"atl {VERSION}")
             return
         else:

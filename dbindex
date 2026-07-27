@@ -37,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BASE_DIR = Path.home() / ".claude" / "db-index"
 INDEX_DIR = BASE_DIR / "indexes"
 LOG_DIR = BASE_DIR / "logs"
@@ -169,6 +169,22 @@ def load_all():
     return out
 
 
+STALE_DAYS = 14
+
+
+def warn_stale(idxs):
+    """D1: schemas only refresh on manual build — say so when an index is old."""
+    for idx in idxs:
+        try:
+            age = (time.time() - time.mktime(time.strptime(
+                idx.get("updated", ""), "%Y-%m-%d %H:%M:%S"))) / 86400
+        except (ValueError, TypeError):
+            continue
+        if age > STALE_DAYS:
+            print(f"note: {idx['entry']} schema index is {age:.0f} days old — "
+                  f"run 'dbindex build {idx['entry']}' after migrations", file=sys.stderr)
+
+
 def score(q, name):
     n = name.lower()
     if n == q:
@@ -198,6 +214,7 @@ def search(query):
 
 
 def cmd_search(query, limit, as_json):
+    warn_stale(load_all())
     hits = sorted(search(query), key=lambda h: (h[0], h[1], h[3], h[4] or ""))
     if as_json:
         print(json.dumps([{"entry": h[1], "database": h[2], "table": h[3],
@@ -219,6 +236,7 @@ def cmd_search(query, limit, as_json):
 
 
 def cmd_table(name, limit):
+    warn_stale(load_all())
     q = name.lower()
     shown = 0
     for idx in load_all():

@@ -10,6 +10,7 @@ Small, dependency-free CLI tools that make AI coding sessions (Claude Code) safe
 - **dbindex** — schema index of every vault DB connection (databases → tables → columns), so "which table holds X" is answered offline with no VPN, connection, or token cost
 - **csession** — task-level index of all Claude Code sessions: find past work, resume-vs-new-session suggestions, compact context briefs, combined work journal, safe pruning
 
+- **toolkit** — one command to install every tool (`toolkit install`) and one to verify the whole setup (`toolkit doctor`: symlinks, versions, PATH, launchd agents, directive freshness, index age, vault health; non-zero exit when broken)
 - **worklog** (`Scripts/worklog/`) — zero-token daily work logs: auto-generated at login and 21:15 from the csession index + git commits (sessions, commits, files touched, improvement flags), backfilling the last 7 days so weekends/leave need no bookkeeping; `worklog week` aggregates for reports, and the `worklog` skill layers AI narrative and coaching on top. See `Output/worklog/README.md` for the file format.
 
 Plus `Scripts/atlassian/atl` — an offline Jira/Confluence fetcher (JQL search, sprint issues, fix-version resolution, page-to-plain-text, accountId lookup, issue creation) authenticated via a `jira-api-token` claude-vault entry. The `Skill/` workflows call it instead of the Atlassian MCP, turning schema-heavy MCP round-trips into compact TSV/text.
@@ -27,9 +28,13 @@ Claude Code's built-in `claude mcp remove` **deletes** a server's config permane
 Requires Python 3 (pre-installed on macOS). No dependencies.
 
 ```bash
-chmod +x claude-toggle
-cp claude-toggle ~/.local/bin/     # or anywhere on your PATH
+./toolkit install        # symlink every tool into ~/.local/bin
+./toolkit doctor         # verify links, versions, PATH, agents, directives, indexes
 ```
+
+`toolkit doctor` exists because of a real incident: the repo moved and every
+symlink silently broke — two tools were dead on PATH for days. Run it after any
+move, upgrade, or when something behaves oddly; it exits non-zero when broken.
 
 ## Usage
 
@@ -58,6 +63,9 @@ claude-toggle squeeze on|off|status               # toggle the global "compress 
                                                   # in ~/.claude/CLAUDE.md
 claude-toggle cindex on|off|status                # toggle the global "search code via
                                                   # the cindex index" directive
+claude-toggle directives                          # every directive: off / current / outdated
+claude-toggle <directive> refresh                 # re-apply current block text after an
+                                                  # upgrade changed the wording
 claude-toggle doctor --fix                        # fix double entries (live+stash) and
                                                   # stashed scopes for deleted projects
 claude-toggle backups                             # list auto-backups
@@ -208,6 +216,8 @@ Raw `grep -r` over a repo dumps hundreds of lines into the AI transcript. `cinde
 cindex authenticate            # symbol + file search (builds index on first use)
 cindex file login              # file-path search only
 cindex grep 'user_sessions' --ext .sql   # capped content grep over indexed files
+cindex --all <query>           # search EVERY indexed project at once (18 repos here);
+                               # a ticket id like PROJ-123 matches branch tags too
 cindex refresh                 # incremental: re-scan only mtime/size-changed files
 cindex build | status | list | prune     # full re-parse / maintain indexes
 cindex <query> --limit 50 --json         # tuning / machine-readable
@@ -217,7 +227,7 @@ To make Claude prefer it in every session, run `claude-toggle cindex on` — sam
 
 **Automated refresh (zero tokens):** `automation/cindex-refresh.sh` + the `com.<user>.cindex-refresh` LaunchAgent run an incremental `cindex refresh` over every code folder in `~/Workspace` at login and daily at 09:00 — pure shell, no Claude session involved. Sweep log: `~/.claude/code-index/logs/cron.log`.
 
-Install: `cp cindex ~/.local/bin/` (or symlink). Pure Python 3, no dependencies.
+Install: `toolkit install` (or `cp cindex ~/.local/bin/`). Pure Python 3, no dependencies.
 
 ## dbindex — indexed database schemas
 
@@ -256,6 +266,7 @@ csession list -n 15               # recent sessions: when, project, task, ~token
 csession show 59f3a355            # one session: tasks asked, files edited, resume cmd
 csession brief 59f3a355 | pbcopy  # context digest → paste into a fresh `claude`
 csession suggest "continue the PROJ-1234 work"   # resume vs new, with the command
+csession PROJ-1234                # ticket search across sessions (prompts + branches)
 csession journal --days 7         # combined work journal
 csession prune --days 45          # cleanup candidates (add --apply to delete)
 ```

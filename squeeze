@@ -45,7 +45,7 @@ import re
 import subprocess
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_KEEP = r"(?i)\b(error|fatal|fail(ed|ure)?s?|exception|traceback|panic|warn(ing)?|denied|refused|timed?[ -]?out|not found)\b"
 
@@ -132,6 +132,14 @@ def trim_json(o, items, str_max=200):
     return o
 
 
+def looks_json(text):
+    try:
+        json.loads(text)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def squeeze_json(text, args):
     try:
         data = json.loads(text)
@@ -187,7 +195,10 @@ def main():
             return 0
         raw = sys.stdin.buffer.read().decode("utf-8", "replace")
 
-    out = squeeze_json(raw, args) if args.json else squeeze_text(raw, args)
+    # Q1: sniff JSON so --json is not required for obvious payloads
+    sniff = raw.lstrip()[:1]
+    is_json = args.json or (sniff in "{[" and len(raw) > 200 and looks_json(raw))
+    out = squeeze_json(raw, args) if is_json else squeeze_text(raw, args)
     sys.stdout.write(out)
     if out and not out.endswith("\n"):
         sys.stdout.write("\n")

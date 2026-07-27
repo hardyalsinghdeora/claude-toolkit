@@ -101,10 +101,10 @@ If Claude Code grows a first-class `disabledMcpServers` field, migrate from the 
 
 _(2026-07-27: 1.4.0 added the directive system — `squeeze`/`cindex`/`dbindex`/`csession` on|off|status toggling marker-delimited blocks in `~/.claude/CLAUDE.md`, with CLAUDE.md added to the backup/prune set.)_
 
-### T9. `directive refresh` — re-apply current block text — **P1, small**
+### T9. ~~`directive refresh`~~ — **done 2026-07-27** (toggle 1.7.0; `<directive> refresh`, `directives refresh`, and drift shown in `status`)
 Directive text is baked into the `DIRECTIVES` dict at enable time (S12): improving the wording in a newer claude-toggle leaves stale text in `CLAUDE.md` until someone does off+on by hand. Add `claude-toggle <name> refresh` (and a `refresh --all`) that replaces the block between the markers with the current text; print a note in `status` when the enabled block differs from the current source text.
 
-### T10. `directives` overview — **P2, small**
+### T10. ~~`directives` overview~~ — **done 2026-07-27** (toggle 1.7.0; one line per directive: disabled / enabled+current / enabled+OUTDATED)
 `claude-toggle directives` — one line per known directive: enabled/disabled, whether the block text is current (see T9), and which tool it belongs to. Today you need four `status` calls.
 
 ### T11. Per-project directives — **P3, medium**
@@ -133,7 +133,7 @@ Default to blocking statements matching `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCAT
 
 ## squeeze (new 2026-07-27)
 
-### Q1. Auto-detect content type — **P2, small**
+### Q1. ~~Auto-detect content type~~ — **done 2026-07-27** (squeeze 1.1.0; JSON payloads compact automatically, no --json needed. JSONL mode still open)
 `--json` is manual today. Sniff the first non-blank byte (`{`/`[`) and switch to JSON mode automatically; add a JSONL mode (compress per line) for log streams.
 
 ### Q2. Named profiles — **P2, small**
@@ -146,10 +146,10 @@ If Claude Code hooks ever allow *transforming* Bash tool output (today PostToolU
 
 _(1.3.0 shipped `.claudeignore` support — task outputs/usage/logs excluded from the searchable index per repo; verified on this repo: 122 → 18 indexed files.)_
 
-### X1. Cross-project search — **P1, small**
+### X1. ~~Cross-project search~~ — **done 2026-07-27** (cindex 1.4.0; `cindex --all <query>` over every project index)
 `cindex --all <query>` searching every index under `~/.claude/code-index/indexes/` at once — "which service defines `SubscriptionRequest`?" spans repos today (18 Workspace projects indexed), and per-repo invocation misses that.
 
-### X2. Ticket/branch tags — **P2, small**
+### X2. ~~Ticket/branch tags~~ — **done 2026-07-27** (cindex 1.4.0; ticket ids extracted from branch names at index time, matched by `--all`)
 Extract Jira ticket IDs (`NAV-\d+` etc.) from branch names at index time so `cindex NAV-10083` finds the repos/branches where a ticket's work lives. Pairs with csession's ticket search (N3).
 
 ### X3. Richer language coverage — **P2, medium**
@@ -160,7 +160,7 @@ Method extraction for Java/Kotlin/C# is heuristic and C/C++ only gets types. Con
 
 ## dbindex (new 2026-07-27)
 
-### D1. Staleness hint — **P1, small**
+### D1. ~~Staleness hint~~ — **done 2026-07-27** (dbindex 1.1.0; searches warn when an index is >14 days old, naming the rebuild command)
 Schemas refresh only via manual `build`. Print a one-line warning on search when an index is older than N days (default 14): "prod-postgres-db schema is 20 days old — `dbindex build prod-postgres-db` after migrations."
 
 ### D2. Relationships — **P2, medium**
@@ -174,13 +174,13 @@ The MySQL path (single crawl split by schema) is written but untested — no MyS
 
 ## csession (new 2026-07-27)
 
-### N1. Outcome-aware briefs — **P1, medium**
+### N1. ~~Outcome-aware briefs~~ — **done 2026-07-27** (csession 1.1.0; each prompt paired with the final assistant reply — briefs now read 'asked X -> result Y')
 `brief` currently replays *prompts* (what was asked), not *outcomes* (what was done). Extract the final assistant text message per user prompt (capped) so a brief reads "asked X → result Y" — materially better seed context for continuing work.
 
 ### N2. SessionStart surfacing — **P2, small**
 A SessionStart hook that prints one line when the new session's cwd matches recent indexed work ("3 recent sessions in this project — `csession list --project ...`"). Costs a few injected tokens; measure before defaulting on (see the zero-token principle from the cron decision).
 
-### N3. Ticket linking — **P2, small**
+### N3. ~~Ticket linking~~ — **done 2026-07-27** (csession 1.1.0; ticket ids from prompts+branches indexed and weighted in search)
 Extract Jira IDs (`NAV-\d+`) from prompts/branches into a `tickets` field: `csession NAV-10083` → every session that touched that ticket. Combines with X2 for a full "ticket → sessions + repos + branches" answer.
 
 ### N4. Scheduled prune report — **P3, small**
@@ -192,13 +192,13 @@ Monthly launchd leg running `csession prune` (dry-run) and appending candidates 
 
 Live-verified: `whoami`, `jql`, `sprint --mine`, `user`, `page` (Jira via scoped token + gateway; Confluence via the separate `confluence-token`).
 
-### A1. Live-validate `version` and `create` — **P0, small**
+### A1. ~~Live-validate `version` and `create`~~ — **done 2026-07-27** (atl 1.1.0; `version` validated live against NAV v1.32.0 — which exposed a real bug: the `version` subcommand was being swallowed by the `--version` flag. `create` gets `--dry-run` (payload + auth check, no POST); a live create still needs an explicit user go-ahead)
 `atl version <url>` and `atl create` are written but never run against real data (`create` deliberately — it makes a real ticket). Validate `version` on the next release URL; validate `create` on a throwaway ticket in a sandbox project, then delete it.
 
-### A2. Identity guard against anonymous degradation — **P1, small**
+### A2. ~~Identity guard against anonymous degradation~~ — **done 2026-07-27** (atl 1.1.0; any empty result is proven via /myself — either 'authenticated as X, genuinely empty' or a hard failure with the token-refresh hint)
 S13: Jira returns 200/empty on bad auth. Persisting gateway mode mostly closes this, but a token *revocation* would reopen it silently. Add `--check` (or automatic on empty results): call `/myself`; if unauthenticated, fail loudly with the vault setup hint instead of printing `# 0 issues`.
 
-### A3. Confluence table extraction — **P2, small**
+### A3. ~~Confluence table extraction~~ — **done 2026-07-27** (atl 1.1.0; ac:parameter/ri/macro-id noise dropped, `<time datetime>` resolved — sprint dates now extract, tables render as rows)
 `atl page` flattens table macros roughly (`12falselistfalse …` artifacts from Confluence storage format). Parse `<table>` into markdown rows and drop macro metadata elements (`ac:structured-macro` parameters) before stripping tags.
 
 ### A4. Bitbucket sibling (`bbt`) — **P2, medium**
@@ -219,13 +219,13 @@ Skills now exist in TWO places: `Promt/Skills/*.md` (older, MCP-first) and `Clau
 
 ## Cross-cutting
 
-### G1. `toolkit doctor` / install script — **P0, small**
+### G1. ~~`toolkit doctor` / install script~~ — **done 2026-07-27** (new `toolkit` CLI: install relinks all 9 tools; doctor checks links/versions/PATH/launchd/directives/index age/vault and exits non-zero. First run caught two real faults: `atl` was never on PATH and `db-conn` had no --version)
 S10 (all symlinks dead for days) needs a guard: an `install.sh` that (re)links every tool into `~/.local/bin`, plus a `doctor` that checks each symlink resolves, each tool runs `--version`, the launchd agents are loaded, and the directive blocks match source (T9). One command after any repo move.
 
 ### G2. Index-family consistency — **P2, small**
 `cindex`/`dbindex`/`csession` share conventions (`~/.claude/<x>-index/`, `indexes/`+`logs/`, mtime-incremental, `--limit/--json`, capped compact output). Extract the shared helpers (log-rotate, score/rank, arg parsing) into a small common module vendored into each tool — they've already drifted slightly (score lives in three files).
 
-### G3. Commit the suite — **P0, tiny**
+### G3. ~~Commit the suite~~ — **done 2026-07-27** (pushed to github.com/hardyalsinghdeora/claude-toolkit)
 The four new tools, automation/, and the doc updates are uncommitted (`git status` shows them untracked). Commit as the "token-optimization suite" milestone.
 
 ---
@@ -242,7 +242,10 @@ After this, credentials are verifiable, importable without chat-pasting, and inj
 
 **Phase 3 — polish & reach: ✅ done 2026-07-27** — V5, V8, V10 (minus Touch-ID), T5, T6, C5 (claude-vault 1.4.0, claude-toggle 1.6.0, db-conn output modes). V11/T7/T8 remain deliberately unbuilt — no concrete need yet.
 
-**Phase 4 — token-optimization suite hardening (added 2026-07-27):**
+**Phase 4 — token-optimization suite hardening: ✅ core done 2026-07-27** — G1, G3, A1, A2, A3, T9, T10, X1, X2, D1, N1, N3, Q1 (new `toolkit` CLI; claude-toggle 1.7.0, cindex 1.4.0, dbindex 1.1.0, csession 1.1.0, squeeze 1.1.0, atl 1.1.0, db-conn 1.2.0).
+Still open, deliberately (no friction yet): G2 shared helpers, A4 Bitbucket `bbt` + K2, A5 backoff, K1 skill dedup, Q2 profiles, X3/X4, D2/D3/D4, N2/N4, T11.
+
+Original order of work:
 1. **G3 commit the suite** (still pending — now also covers atl, skills, ignore files, docs) + **G1 doctor/install** — S10 must not happen again; everything else builds on a healthy install.
 2. **A1 validate version/create** + **A2 identity guard** — atl is now on the critical path of four skills; close its two known gaps first.
 3. **T9 directive refresh**, **X1 cross-project search**, **D1 staleness hint**, **N1 outcome-aware briefs** — the four highest-leverage gaps in the index suite.

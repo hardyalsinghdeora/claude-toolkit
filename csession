@@ -18,9 +18,11 @@
 #   csession <query>              # find past sessions by task/topic
 #   csession list [-n 15]         # recent sessions: when, project, task, size
 #   csession show <id-prefix>     # one session's tasks, prompts, files touched
-#   csession brief <id-prefix>    # compact digest to paste into a NEW session
-#                                 # (continue old work without resuming a huge
-#                                 # transcript — far fewer tokens)
+#   csession brief <id-prefix>    # compact digest to paste into a NEW session:
+#                                 # each prompt paired with what was actually done
+#                                 # (asked -> outcome), plus tickets and files —
+#                                 # continue old work without resuming a huge transcript
+#   csession PROJ-123             # ticket ids are indexed from prompts and branches
 #   csession suggest "<task>"     # recommend: resume an existing session or
 #                                 # start new, with the exact command to run
 #   csession journal [--days 7]   # combined what-I-worked-on journal
@@ -43,7 +45,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROJECTS = Path.home() / ".claude" / "projects"
 BASE_DIR = Path.home() / ".claude" / "session-index"
 INDEX_FILE = BASE_DIR / "index.json"
@@ -51,6 +53,8 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "csession.log"
 RESUME_TOKEN_LIMIT = 60000
 MAX_PROMPTS = 40
+MAX_OUTCOME = 220
+TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 MAX_FILES = 30
 
 
@@ -84,7 +88,8 @@ def clean_text(c):
 def parse_session(path):
     rec = {"project": decode_project(path.parent.name), "title": None,
            "cwd": None, "branch": None, "start": None, "end": None,
-           "prompts": [], "summaries": [], "files": [], "n_assistant": 0,
+           "prompts": [], "outcomes": [], "summaries": [], "files": [],
+           "tickets": [], "n_assistant": 0,
            "bytes": path.stat().st_size, "mtime": path.stat().st_mtime}
     files = []
     try:
@@ -111,10 +116,18 @@ def parse_session(path):
                     s = clean_text(d.get("message", {}).get("content"))
                     if s and len(rec["prompts"]) < MAX_PROMPTS:
                         rec["prompts"].append(s[:300])
+                        rec["outcomes"].append("")   # filled by the replies below
                 elif t == "assistant" and not d.get("isSidechain"):
                     rec["n_assistant"] += 1
                     content = d.get("message", {}).get("content")
                     if isinstance(content, list):
+                        # N1: keep the LAST text reply for the current prompt —
+                        # what was actually done, not just what was asked
+                        said = " ".join(b.get("text", "") for b in content
+                                        if isinstance(b, dict) and b.get("type") == "text")
+                        said = re.sub(r"\s+", " ", said).strip()
+                        if said and rec["outcomes"]:
+                            rec["outcomes"][-1] = said[:MAX_OUTCOME]
                         for b in content:
                             if (isinstance(b, dict) and b.get("type") == "tool_use"
                                     and b.get("name") in ("Edit", "Write", "NotebookEdit")):
@@ -124,6 +137,8 @@ def parse_session(path):
     except OSError:
         pass
     rec["files"] = files[:MAX_FILES]
+    blob = " ".join(rec["prompts"]) + " " + (rec.get("branch") or "")
+    rec["tickets"] = sorted(set(TICKET_RE.findall(blob.upper())))[:10]
     return rec
 
 
@@ -197,8 +212,11 @@ def score_session(words, rec):
     text_sum = " ".join(rec["summaries"]).lower()
     text_pr = " ".join(rec["prompts"]).lower()
     text_files = " ".join(rec["files"]).lower()
+    text_tickets = " ".join(rec.get("tickets", [])).lower()
     sc = 0
     for w in words:
+        if w in text_tickets:
+            sc += 4
         if w in text_title:
             sc += 3
         if w in text_sum:
@@ -272,10 +290,16 @@ def cmd_brief(idx, sid):
         print(f"Topic: {rec['title']}")
     for s in rec["summaries"]:
         print(f"Summary: {s}")
+    if rec.get("tickets"):
+        print(f"Tickets: {', '.join(rec['tickets'])}")
     if rec["prompts"]:
-        print("Work requested, in order:")
-        for p in rec["prompts"]:
-            print(f"  {p[:200]}")
+        print("Work, in order (asked -> outcome):")
+        outcomes = rec.get("outcomes", [])
+        for n, p in enumerate(rec["prompts"]):
+            print(f"  asked:  {p[:200]}")
+            got = outcomes[n] if n < len(outcomes) else ""
+            if got:
+                print(f"  result: {got}")
     if rec["files"]:
         print("Files created/edited: " + ", ".join(rec["files"]))
     print("\n(paste this into a new session to continue this work without "
