@@ -18,6 +18,7 @@
 #   db-conn <entry> <database> -f query.sql       # SQL from a file
 #   db-conn <entry> <database> -f q.sql --csv     # CSV output
 #   db-conn --env prod|stg|test|local ...         # shorthand for <env>-postgres-db
+#   db-conn <prod-entry> <db> "UPDATE ..." --write  # prod is read-only unless --write
 #
 # Examples:
 #   db-conn prod-postgres-db mydb "SELECT id, username FROM users LIMIT 5"
@@ -151,11 +152,12 @@ case "$cmd" in
     ;;
   *)
     db="$cmd"
-    csv=0; sql=""; file=""
+    csv=0; sql=""; file=""; write=0
     i=1
     while [ $i -lt ${#POS[@]} ]; do
       case "${POS[$i]}" in
         --csv) csv=1 ;;
+        --write) write=1 ;;
         -f) i=$((i+1)); file="${POS[$i]}" ;;
         *) sql="${POS[$i]}" ;;
       esac
@@ -165,6 +167,20 @@ case "$cmd" in
       echo "db-conn: no SQL given — pass \"<SQL>\" or -f query.sql" >&2
       exit 1
     fi
+    # C4: prod write guard — read-only by construction unless --write is passed
+    case "$ENTRY" in
+      *prod*)
+        if [ "$write" -eq 0 ]; then
+          content="$sql"
+          [ -n "$file" ] && content="$(cat "$file")"
+          if printf '%s' "$content" | grep -qiE '\b(insert|update|delete|drop|alter|truncate|create|grant|revoke)\b'; then
+            echo "db-conn: blocked — this looks like a WRITE statement against prod ('$ENTRY')." >&2
+            echo "         re-run with --write if you really mean to modify prod." >&2
+            exit 1
+          fi
+        fi
+        ;;
+    esac
     if [ "$ENGINE" = "mysql" ]; then
       if [ -n "$file" ]; then
         if [ "$csv" -eq 1 ]; then run_my -B "$db" < "$file" | tsv2csv

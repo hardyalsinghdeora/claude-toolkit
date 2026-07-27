@@ -26,6 +26,14 @@ Usage:
   claude-vault pin disable <name>
   claude-vault list                           # names + descriptions only, no values
   claude-vault delete <name>
+  claude-vault doctor [--fix]                 # reconcile Keychain vs index (adopt/prune drift)
+  claude-vault test <name> | --all            # live-check DB credentials: ok / auth-failed /
+                                              #   unreachable (VPN hint) — no values printed
+  claude-vault import <file|-> --name <entry> [--map POSTGRES_HOST=host,...]
+                                              # .env -> one JSON entry (kills paste-into-chat)
+  claude-vault exec <name> [--prefix PG] -- <cmd> [args...]
+                                              # run cmd with fields as env vars; the secret
+                                              #   never transits the shell or transcript
   claude-vault help
 
 Password-type entries are never printed to a terminal — only into a pipe or
@@ -53,12 +61,14 @@ import hashlib
 import hmac as hmac_mod
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SERVICE_PREFIX = "claude-vault."
 INDEX = Path.home() / ".claude" / "vault-index.json"
 ACCOUNT = getpass.getuser()
@@ -364,6 +374,187 @@ def cmd_delete(name):
     print(f"deleted '{name}'")
 
 
+def kc_all_names():
+    """All claude-vault.* service names present in the login Keychain."""
+    r = keychain(["dump-keychain"])
+    pat = r'"svce"<blob>="' + re.escape(SERVICE_PREFIX) + r'([^"]+)"'
+    return sorted(set(re.findall(pat, r.stdout)))
+
+
+def cmd_doctor(fix=False):
+    idx = load_index()
+    kc = kc_all_names()
+    only_kc = [n for n in kc if n not in idx]
+    only_idx = [n for n in idx if n not in kc]
+    bad_json = []
+    for n, m in idx.items():
+        if entry_type(m) == "json" and not m.get("pin") and n in kc:
+            raw = kc_get(n)
+            if raw is not None and not is_pin_locked(raw):
+                try:
+                    json.loads(raw)
+                except json.JSONDecodeError:
+                    bad_json.append(n)
+    if not (only_kc or only_idx or bad_json):
+        print(f"doctor: Keychain and index agree ({len(idx)} entries), all JSON entries parse.")
+        return
+    for n in only_kc:
+        print(f"in Keychain but not index: '{n}'" + ("  -> adopting" if fix else ""))
+        if fix:
+            raw = kc_get(n) or ""
+            if is_pin_locked(raw):
+                t, pin = "plain", True
+            else:
+                try:
+                    json.loads(raw)
+                    t, pin = "json", False
+                except json.JSONDecodeError:
+                    t, pin = "plain", False
+            idx[n] = {"desc": "(adopted by doctor)", "type": t, "pin": pin,
+                      "updated": datetime.now().isoformat(timespec="seconds")}
+    for n in only_idx:
+        print(f"in index but not Keychain: '{n}'" + ("  -> pruning" if fix else ""))
+        if fix:
+            del idx[n]
+    for n in bad_json:
+        print(f"json-typed entry does not parse as JSON: '{n}' (fix with: claude-vault set {n} --json)")
+    if fix:
+        save_index(idx)
+        print("doctor: fixed.")
+    elif only_kc or only_idx:
+        print("run 'claude-vault doctor --fix' to adopt/prune.")
+
+
+def test_entry(name):
+    raw = kc_get(name)
+    if raw is None:
+        return "missing from Keychain (doctor)"
+    if is_pin_locked(raw):
+        return "pin-locked — skipped"
+    try:
+        cfg = json.loads(raw)
+    except json.JSONDecodeError:
+        return "not JSON — skipped"
+    host, user = cfg.get("host"), cfg.get("user")
+    if not host:
+        return "no host field — skipped"
+    port = str(cfg.get("port") or "")
+    engine = cfg.get("engine") or ("mysql" if port == "3306" else "postgres")
+    port = port or ("3306" if engine == "mysql" else "5432")
+    if subprocess.run(["nc", "-z", "-G", "3", host, port], capture_output=True).returncode != 0:
+        return f"UNREACHABLE {host}:{port} — private endpoint? connect to the VPN"
+    pw = cfg.get("password")
+    for suffix in (f".{user}", f".{user}.rw", f".{user}.ro"):
+        if pw:
+            break
+        cand = kc_get(name + suffix)
+        if cand and not is_pin_locked(cand):
+            pw = cand
+    if not pw:
+        return f"reachable {host}:{port} — no password entry to auth-test"
+    client = "psql" if engine == "postgres" else "mysql"
+    if not shutil.which(client):
+        return f"reachable — '{client}' client not installed, cannot auth-test"
+    db = cfg.get("database") or ("postgres" if engine == "postgres" else "")
+    env = dict(os.environ)
+    if engine == "postgres":
+        env.update(PGPASSWORD=pw, PGCONNECT_TIMEOUT="5")
+        r = subprocess.run(["psql", "-h", host, "-p", port, "-U", user,
+                            "-d", db or "postgres", "-tAc", "SELECT 1"],
+                           capture_output=True, text=True, env=env)
+    else:
+        env.update(MYSQL_PWD=pw)
+        r = subprocess.run(["mysql", "-h", host, "-P", port, "-u", user, "--protocol=TCP",
+                            *([db] if db else []), "-e", "SELECT 1"],
+                           capture_output=True, text=True, env=env)
+    if r.returncode == 0:
+        return "ok"
+    err = (r.stderr.strip().splitlines() or ["auth failed"])[-1]
+    return f"AUTH FAILED: {err[:90]}"
+
+
+def cmd_test(name, all_):
+    idx = load_index()
+    targets = ([name] if name else
+               [n for n, m in sorted(idx.items()) if entry_type(m) == "json"])
+    if not targets:
+        sys.exit("nothing to test — no JSON entries" if all_ else "usage: claude-vault test <name>|--all")
+    w = max(len(n) for n in targets)
+    for n in targets:
+        print(f"{n.ljust(w)}  {test_entry(n)}")
+
+
+DEFAULT_ENV_MAP = {"HOST": "host", "PORT": "port", "USER": "user", "USERNAME": "user",
+                   "PASSWORD": "password", "PASS": "password", "DATABASE": "database",
+                   "DB": "database", "NAME": "database", "ENGINE": "engine"}
+ENV_PREFIXES = ("POSTGRES_", "POSTGRESQL_", "MYSQL_", "PG_", "PG", "DB_", "DATABASE_")
+
+
+def cmd_import(path, name, map_arg, desc):
+    text = sys.stdin.read() if path == "-" else Path(path).read_text()
+    mapping = {}
+    if map_arg:
+        for pair in map_arg.split(","):
+            if "=" not in pair:
+                sys.exit(f"--map entries must be ENVKEY=field, got '{pair}'")
+            k, v = pair.split("=", 1)
+            mapping[k.strip()] = v.strip()
+    data, unmapped = {}, []
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", s)
+        if not s or s.startswith("#") or not m:
+            continue
+        key, val = m.group(1), m.group(2).strip().strip("'\"")
+        if key in mapping:
+            data[mapping[key]] = val
+            continue
+        base = key
+        for p in ENV_PREFIXES:
+            if base.startswith(p):
+                base = base[len(p):]
+                break
+        if base in DEFAULT_ENV_MAP:
+            data[DEFAULT_ENV_MAP[base]] = val
+        else:
+            unmapped.append(key)
+    if not data:
+        sys.exit("no recognizable variables found — use --map ENVKEY=field,...")
+    kc_set(name, json.dumps(data))
+    idx = load_index()
+    idx[name] = {"desc": desc or f"imported from {path}", "type": "json", "pin": False,
+                 "updated": datetime.now().isoformat(timespec="seconds")}
+    save_index(idx)
+    print(f"stored '{name}' with fields: {', '.join(sorted(data))}")
+    if unmapped:
+        print(f"ignored (no mapping): {', '.join(unmapped)}")
+    if path != "-":
+        print(f"the plaintext file still exists — consider: rm {path}")
+
+
+def cmd_exec(name, prefix, cmd_args):
+    raw = kc_get(name)
+    if raw is None:
+        sys.exit(f"no secret named '{name}' — run 'claude-vault list'")
+    value, _ = unlock(name, raw)
+    env = dict(os.environ)
+    try:
+        data = json.loads(value)
+        if not isinstance(data, dict):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        data = None
+    if data is not None:
+        for k, v in data.items():
+            env[(prefix or "") + str(k).upper()] = str(v)
+    else:
+        env[prefix or name.upper().replace("-", "_").replace(".", "_")] = value
+    try:
+        os.execvpe(cmd_args[0], cmd_args, env)
+    except FileNotFoundError:
+        sys.exit(f"exec: command not found: {cmd_args[0]}")
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
@@ -422,6 +613,43 @@ def main():
         cmd_pin(args[1], args[2])
     elif cmd == "list":
         cmd_list()
+    elif cmd == "doctor":
+        cmd_doctor(fix="--fix" in args)
+    elif cmd == "test":
+        all_ = "--all" in args
+        name = args[1] if len(args) > 1 and not args[1].startswith("--") else None
+        cmd_test(name, all_)
+    elif cmd == "import":
+        if len(args) < 2:
+            sys.exit("usage: claude-vault import <file|-> --name <entry> "
+                     "[--map ENVKEY=field,...] [--desc \"text\"]")
+        name = map_arg = desc = None
+        for flag in ("--name", "--map", "--desc"):
+            if flag in args:
+                i = args.index(flag)
+                if i + 1 >= len(args):
+                    sys.exit(f"{flag} needs a value")
+                val = args[i + 1]
+                name = val if flag == "--name" else name
+                map_arg = val if flag == "--map" else map_arg
+                desc = val if flag == "--desc" else desc
+        if not name:
+            sys.exit("import needs --name <entry>")
+        cmd_import(args[1], name, map_arg, desc)
+    elif cmd == "exec":
+        if "--" not in args or len(args) < 2:
+            sys.exit("usage: claude-vault exec <name> [--prefix PG] -- <cmd> [args...]")
+        sep = args.index("--")
+        head, cmd_args = args[1:sep], args[sep + 1:]
+        if not head or not cmd_args:
+            sys.exit("usage: claude-vault exec <name> [--prefix PG] -- <cmd> [args...]")
+        prefix = None
+        if "--prefix" in head:
+            i = head.index("--prefix")
+            if i + 1 >= len(head):
+                sys.exit("--prefix needs a value")
+            prefix = head[i + 1]
+        cmd_exec(head[0], prefix, cmd_args)
     elif cmd == "delete":
         if len(args) < 2:
             sys.exit("usage: claude-vault delete <name>")

@@ -47,6 +47,12 @@ claude-toggle profile load <name> --all           # ...also overwrite settings.j
 claude-toggle profile load <name> --settings-only # ...only settings.json
 claude-toggle profile list
 
+claude-toggle status                              # enabled/disabled summary, matching
+                                                  # profile, directive states
+claude-toggle diff <profile>                      # what loading this profile would change
+claude-toggle group set work atlassian zoho       # named server sets ...
+claude-toggle disable @work                       # ... toggled together
+
 claude-toggle squeeze on|off|status               # toggle the global "compress verbose
                                                   # output via squeeze" directive
                                                   # in ~/.claude/CLAUDE.md
@@ -97,6 +103,13 @@ claude-vault pin enable my-pw            # optional per-entry PIN lock (default 
                                          # value stored PBKDF2-encrypted, reads
                                          # prompt for the PIN
 claude-vault pin disable my-pw
+
+claude-vault doctor --fix                # reconcile Keychain vs index (adopt/prune drift)
+claude-vault test prod-postgres-db       # live check: ok / AUTH FAILED / UNREACHABLE (VPN hint)
+claude-vault test --all                  # health-check every JSON entry
+claude-vault import .env --name mydb     # .env -> one JSON entry (POSTGRES_*/DB_*/MYSQL_* auto-mapped)
+claude-vault exec mydb --prefix PG -- psql   # run with PGHOST/PGUSER/PGPASSWORD... exported;
+                                             # the secret never transits the shell or transcript
 ```
 
 **Team convention — shared DB config, per-member passwords.** Keep the connection
@@ -137,6 +150,8 @@ db-conn inventory-mysql-db inventorydb "SELECT COUNT(*) FROM items" --csv
 db-conn prod-postgres-db --user teammate2 mydb "SELECT 1"
 db-conn prod-postgres-db --role ro mydb "SELECT ..."   # view-only password
 db-conn prod-postgres-db mydb -f lookup.sql --csv > out.csv
+db-conn prod-postgres-db mydb "UPDATE ..." --write   # prod is READ-ONLY unless --write:
+                                                     # INSERT/UPDATE/DELETE/DDL are blocked
 ```
 
 ## squeeze — output compression for token-light sessions

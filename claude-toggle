@@ -9,8 +9,13 @@ moves it back. Every mutation first writes a timestamped backup of
 
 Usage:
   claude-toggle list                     # all servers, status, endpoint
-  claude-toggle disable <server>|--all [--project <path>|--global]
-  claude-toggle enable  <server>|--all [--project <path>|--global]
+  claude-toggle status                   # enabled/disabled summary, matching profile,
+                                         # directive states
+  claude-toggle disable <server>|@group|--all [--project <path>|--global]
+  claude-toggle enable  <server>|@group|--all [--project <path>|--global]
+  claude-toggle group set <name> <server> [server...]   # named server sets
+  claude-toggle group list | delete <name>              # e.g. disable @work
+  claude-toggle diff <profile>           # what loading this profile would change
   claude-toggle profile save <name>      # snapshot MCP config + settings.json
   claude-toggle profile load <name> [--all|--settings-only]
                                          # default loads MCP config ONLY;
@@ -40,13 +45,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 HOME = Path.home()
 CLAUDE_JSON = HOME / ".claude.json"
 SETTINGS_JSON = HOME / ".claude" / "settings.json"
 GLOBAL_MD = HOME / ".claude" / "CLAUDE.md"
 STASH = HOME / ".claude" / "mcp-disabled.json"
+GROUPS = HOME / ".claude" / "toggle-groups.json"
 BACKUPS = HOME / ".claude" / "backups"
 PROFILES = HOME / ".claude" / "config-profiles"
 
@@ -197,7 +203,110 @@ def pick_scopes(arg_scope):
 
 
 def match(server, name):
-    return server == ALL or server == name
+    if server == ALL:
+        return True
+    if isinstance(server, (list, set)):
+        return name in server
+    return server == name
+
+
+def expand_server(server):
+    """Resolve @group to its server list; plain names pass through."""
+    if isinstance(server, str) and server.startswith("@"):
+        groups = load(GROUPS, {})
+        members = groups.get(server[1:])
+        if not members:
+            sys.exit(f"no group '{server[1:]}' — run 'claude-toggle group list'")
+        return members
+    return server
+
+
+def cmd_group(action, rest):
+    groups = load(GROUPS, {})
+    if action == "list":
+        if not groups:
+            print("No groups. Create one: claude-toggle group set work atlassian zoho")
+        for g, members in sorted(groups.items()):
+            print(f"@{g}: {', '.join(members)}")
+    elif action == "set":
+        if len(rest) < 2:
+            sys.exit("usage: claude-toggle group set <name> <server> [server...]")
+        groups[rest[0].lstrip("@")] = rest[1:]
+        save(GROUPS, groups)
+        print(f"group @{rest[0].lstrip('@')} = {', '.join(rest[1:])}")
+    elif action == "delete":
+        if not rest or rest[0].lstrip("@") not in groups:
+            sys.exit("usage: claude-toggle group delete <name>  (see 'group list')")
+        del groups[rest[0].lstrip("@")]
+        save(GROUPS, groups)
+        print(f"deleted group @{rest[0].lstrip('@')}")
+    else:
+        sys.exit("usage: claude-toggle group set|list|delete ...")
+
+
+def profile_matches(cfg, stash):
+    """Names of saved profiles whose MCP snapshot equals the current state."""
+    cur = (mcp_snapshot(cfg), stash)
+    out = []
+    for p in sorted(PROFILES.glob("*.json")) if PROFILES.exists() else []:
+        prof = load(p, {})
+        if (prof.get("mcp"), prof.get("stash", {})) == cur:
+            out.append(p.stem)
+    return out
+
+
+def cmd_status():
+    cfg = load(CLAUDE_JSON, {})
+    stash = load(STASH, {})
+    en = sum(len(s) for _, s in scopes(cfg))
+    dis = sum(len(s) for s in stash.values())
+    print(f"servers: {en} enabled, {dis} disabled")
+    for key, servers in scopes(cfg):
+        if servers:
+            print(f"  {scope_label(key)}: {', '.join(sorted(servers))}")
+    for key, servers in stash.items():
+        if servers:
+            print(f"  {scope_label(key)} (disabled): {', '.join(sorted(servers))}")
+    matches = profile_matches(cfg, stash)
+    print(f"profile: {'matches ' + ', '.join(matches) if matches else 'no saved profile matches'}")
+    md = GLOBAL_MD.read_text() if GLOBAL_MD.exists() else ""
+    states = [f"{n}={'on' if directive_markers(n)[0] in md else 'off'}" for n in DIRECTIVES]
+    print(f"directives: {'  '.join(states)}")
+
+
+def cmd_diff(name):
+    pfile = PROFILES / f"{name}.json"
+    if not pfile.exists():
+        sys.exit(f"no profile named '{name}' — run 'claude-toggle profile list'")
+    prof = load(pfile, {})
+    cfg = load(CLAUDE_JSON, {})
+    cur, want = mcp_snapshot(cfg), prof.get("mcp", {})
+
+    def flat(snap):
+        out = {}
+        for n, sc in snap.get("mcpServers", {}).items():
+            out[(GLOBAL, n)] = sc
+        for proj, pdata in snap.get("projects", {}).items():
+            for n, sc in pdata.get("mcpServers", {}).items():
+                out[(proj, n)] = sc
+        return out
+
+    a, b = flat(cur), flat(want)
+    changes = False
+    for key in sorted(set(a) | set(b)):
+        scope, n = scope_label(key[0]), key[1]
+        if key not in b:
+            print(f"- would remove '{n}' from {scope}"); changes = True
+        elif key not in a:
+            print(f"+ would add    '{n}' to {scope}"); changes = True
+        elif a[key] != b[key]:
+            print(f"~ would change '{n}' config in {scope}"); changes = True
+    if load(STASH, {}) != prof.get("stash", {}):
+        print("~ disabled-server stash would change"); changes = True
+    if prof.get("settings", {}) != load(SETTINGS_JSON, {}):
+        print("~ settings.json differs (only applied with --all)"); changes = True
+    if not changes:
+        print(f"profile '{name}' matches the current state — loading it would change nothing")
 
 
 def cmd_disable(server, arg_scope):
@@ -402,7 +511,7 @@ def main():
     elif cmd in ("disable", "enable"):
         if len(args) < 2:
             sys.exit(f"usage: claude-toggle {cmd} <server>|--all [--project <path>|--global]")
-        server, scope = args[1], None
+        server, scope = expand_server(args[1]), None
         if "--global" in args[2:]:
             scope = GLOBAL
         if "--project" in args:
@@ -411,6 +520,16 @@ def main():
                 sys.exit("--project needs a path")
             scope = str(Path(args[i + 1]).expanduser().resolve())
         (cmd_disable if cmd == "disable" else cmd_enable)(server, scope)
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "diff":
+        if len(args) < 2:
+            sys.exit("usage: claude-toggle diff <profile>")
+        cmd_diff(args[1])
+    elif cmd == "group":
+        if len(args) < 2:
+            sys.exit("usage: claude-toggle group set|list|delete ...")
+        cmd_group(args[1], args[2:])
     elif cmd == "profile":
         if len(args) < 2:
             sys.exit("usage: claude-toggle profile save|load|list [name] [--all|--settings-only]")

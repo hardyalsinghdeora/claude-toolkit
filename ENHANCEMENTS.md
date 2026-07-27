@@ -37,7 +37,7 @@ Today stdin piping works by accident of `sys.stdin.isatty()`. Make it official:
 ### V3. Update a single JSON field — **P0, small**
 `claude-vault set <name> --field password` prompts for just that field, merges into the existing JSON. Avoids the rebuild-whole-blob dance of S4 and avoids re-pasting fields that were already correct.
 
-### V4. `doctor` — reconcile Keychain vs index — **P1, medium**
+### V4. ~~`doctor` — reconcile Keychain vs index~~ — **done 2026-07-27** (vault 1.3.0; report by default, `--fix` adopts/prunes)
 Scan the Keychain for `claude-vault.*` service items and diff against `vault-index.json`:
 - item in Keychain but not index → offer to adopt (S2)
 - index entry with no Keychain item → offer to prune
@@ -47,16 +47,16 @@ Run automatically (cheap check) at the top of `list`.
 ### V5. Rotation metadata + staleness warnings — **P2, small**
 Optional `--rotate-days N` on `set`; `list` and `get` print a warning once an entry is older than its rotation window. Would have surfaced S1 before the failed logins.
 
-### V6. `test <name>` — live credential check — **P1, medium**
+### V6. ~~`test <name>` — live credential check~~ — **done 2026-07-27** (vault 1.3.0; ok / AUTH FAILED / UNREACHABLE-with-VPN-hint, resolves per-member password entries, `--all`)
 For JSON secrets that look like DB credentials (have host/user/password), attempt a real connection (`psql`/`mysql` picked by port or a `type` field) and report ok/auth-failed/unreachable. Distinguishes "wrong password" from "VPN off" — exactly the S1 vs S7 ambiguity. `--all` flag to health-check the whole vault.
 
-### V7. Import from `.env` / bulk add — **P1, medium**
+### V7. ~~Import from `.env` / bulk add~~ — **done 2026-07-27** (vault 1.3.0; POSTGRES_*/DB_*/MYSQL_* auto-map + `--map`)
 `claude-vault import <file|-> --name core-db --map POSTGRES_HOST=host,POSTGRES_USER=user,POSTGRES_PASSWORD=password` (with sane defaults for the common `POSTGRES_*`/`DB_*`/`MYSQL_*` prefixes). Kills the paste-secrets-into-chat pattern of S6.
 
 ### V8. Reference tracking / rename safety — **P2, small**
 `rename` and `delete` grep known consumer scripts (start with this repo, configurable list) for the entry name and warn: "`core-db` references `prod-code-db`". Prevents S8-style silent breakage.
 
-### V9. `exec` — inject secrets as env vars — **P1, medium**
+### V9. ~~`exec` — inject secrets as env vars~~ — **done 2026-07-27** (vault 1.3.0; `--prefix PG` -> PGHOST/PGUSER/..., os.execvpe so the value never transits the shell)
 `claude-vault exec <name> [--prefix PG] -- psql -h ...` runs a child process with fields exported (`PGHOST/PGUSER/PGPASSWORD` mapping built in). The secret never transits the parent shell, command line, or transcript at all — stronger than `$(claude-vault get ...)` substitution.
 
 ### V10. Quality-of-life — **P2, small each**
@@ -79,12 +79,12 @@ Abstract `kc_set/kc_get/kc_delete` behind a backend interface: macOS `security` 
 ### T2. Profile load is destructive to settings.json — **P0, small**
 `profile load` **replaces** `settings.json` wholesale with whatever was snapshotted, silently dropping anything added since the snapshot (permissions, hooks…). Fix: back up `settings.json` too (today only `.claude.json` is backed up), and add `--mcp-only` / `--settings-only` flags; make `--mcp-only` the default and full overwrite opt-in.
 
-### T3. `status` / `diff` — **P1, medium**
+### T3. ~~`status` / `diff`~~ — **done 2026-07-27** (toggle 1.5.0; status includes matching-profile detection and directive states)
 - `claude-toggle diff <profile>` — what would change if this profile were loaded
 - `claude-toggle status` — current enabled/disabled summary + which profile (if any) it matches
 Removes the guess-and-check around "which profile am I on?"
 
-### T4. Server groups — **P1, small**
+### T4. ~~Server groups~~ — **done 2026-07-27** (toggle 1.5.0; `group set/list/delete`, `disable @work`, stored in ~/.claude/toggle-groups.json)
 Named sets in a small config file (e.g. `browser = claude-in-chrome`, `work = atlassian, zoho`): `claude-toggle disable @work`. Cheaper than full profiles when you just want to shed a category.
 
 ### T5. `doctor` — consistency checks — **P2, small**
@@ -123,7 +123,7 @@ Before running psql, probe the host (`nc -z -G 3 $HOST $PORT`). On failure print
 ### C3. Multi-environment support — **P0, small**
 `core-db --env prod|stg|test|local ...` (default `prod`) selecting the `<env>-core-db` vault entry. All four entries already exist with identical shape, so this is just string substitution.
 
-### C4. Prod write guard — **P1, small**
+### C4. ~~Prod write guard~~ — **done 2026-07-27** (db-conn; entries matching *prod* block INSERT/UPDATE/DELETE/DDL unless `--write`)
 Default to blocking statements matching `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE` when `--env prod`, unless `--write` is passed. A one-line regex gate that makes the common case (read-only lookups for support requests) safe by construction.
 
 ### C5. Convenience output modes — **P2, small**
@@ -237,7 +237,7 @@ Everything here is small, and each item prevented or would have prevented a real
 
 **Interlude — team credentials (✅ done 2026-07-17, claude-vault 1.2.0):** password-type entries (never displayed on a terminal; `--copy` for clipboard), DB config split from per-member password entries (`<config>.<dbuser>[.ro|.rw]`, resolved by `core-db --user/--role`), and optional per-entry PIN lock (`pin enable/disable`, PBKDF2+HMAC encrypted at rest, off by default).
 
-**Phase 2 — trust the vault (a weekend):** V4, V6, V7, V9, T3, T4, C4
+**Phase 2 — trust the vault: ✅ done 2026-07-27** — V4, V6, V7, V9, T3, T4, C4 (claude-vault 1.3.0, claude-toggle 1.5.0, db-conn write guard)
 After this, credentials are verifiable, importable without chat-pasting, and injectable without shell substitution.
 
 **Phase 3 — polish & reach (as needed):** V5, V8, V10, T5, T6, C5, then V11/T7/T8 only if a concrete need appears.
