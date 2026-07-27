@@ -75,17 +75,17 @@ Companion tool in this repo. Stores secrets (DB credentials, API keys, personal 
 Built to use with AI sessions: Claude fetches a credential at the moment it needs it instead of the value sitting in prompts, memory, or config files.
 
 ```bash
-claude-vault set asset-db --json --desc "MySQL for asset-logistic"
+claude-vault set inventory-db --json --desc "MySQL for the inventory service"
 #  paste: {"host":"...","port":"3306","user":"...","password":"...","database":"..."}
 claude-vault set jira-token --desc "Jira API token"
 
 claude-vault list                        # names + descriptions only, no values
-claude-vault get asset-db --field host   # one field of a JSON secret
+claude-vault get inventory-db --field host   # one field of a JSON secret
 claude-vault get jira-token              # whole value
-claude-vault set asset-db --field password   # update ONE field, keep the rest
+claude-vault set inventory-db --field password   # update ONE field, keep the rest
 claude-vault set jira-token --from-clipboard # take the value from the clipboard
 printf '%s\n' "$VAL" | claude-vault set x --stdin   # scriptable set
-claude-vault rename asset-db asset-db-old
+claude-vault rename inventory-db inventory-db-old
 claude-vault delete jira-token
 
 claude-vault set my-pw --password        # password-type: NEVER displayed on a
@@ -113,13 +113,13 @@ Never pass the secret itself as a CLI argument — it would land in shell histor
 Example — query a DB using stored credentials:
 
 ```bash
-mysql -h "$(claude-vault get asset-db --field host)" \
-      -u "$(claude-vault get asset-db --field user)" \
-      -p"$(claude-vault get asset-db --field password)" \
-      "$(claude-vault get asset-db --field database)" -e "SELECT ..."
+mysql -h "$(claude-vault get inventory-db --field host)" \
+      -u "$(claude-vault get inventory-db --field user)" \
+      -p"$(claude-vault get inventory-db --field password)" \
+      "$(claude-vault get inventory-db --field database)" -e "SELECT ..."
 ```
 
-In a Claude Code session, just say e.g. *"search the asset DB for X — credentials are in claude-vault under `asset-db`"*.
+In a Claude Code session, just say e.g. *"search the inventory DB for X — credentials are in claude-vault under `inventory-db`"*.
 
 Install: same as claude-toggle (`cp claude-vault ~/.local/bin/`). macOS only.
 
@@ -131,7 +131,7 @@ Engine-agnostic wrapper (Postgres and MySQL/MariaDB) that pulls the connection c
 db-conn list                                       # config entries in the vault
 db-conn prod-postgres-db mydb "SELECT id, username FROM users LIMIT 5"
 db-conn --env stg tables mydb                     # --env X == entry X-postgres-db
-db-conn asset-mysql-db assetdb "SELECT COUNT(*) FROM assets" --csv
+db-conn inventory-mysql-db inventorydb "SELECT COUNT(*) FROM items" --csv
 db-conn prod-postgres-db --user teammate2 mydb "SELECT 1"
 db-conn prod-postgres-db --role ro mydb "SELECT ..."   # view-only password
 db-conn prod-postgres-db mydb -f lookup.sql --csv > out.csv
@@ -184,7 +184,7 @@ cindex <query> --limit 50 --json         # tuning / machine-readable
 
 To make Claude prefer it in every session, run `claude-toggle cindex on` — same marker-block mechanism as the squeeze directive: adds a "search code via cindex, then Read only the file:line it points at" instruction to `~/.claude/CLAUDE.md`, `off` removes exactly that block, and `CLAUDE.md` is backed up before every change.
 
-**Automated refresh (zero tokens):** `automation/cindex-refresh.sh` + the `com.example.cindex-refresh` LaunchAgent run an incremental `cindex refresh` over every code folder in `~/Workspace` at login and daily at 09:00 — pure shell, no Claude session involved. Sweep log: `~/.claude/code-index/logs/cron.log`.
+**Automated refresh (zero tokens):** `automation/cindex-refresh.sh` + the `com.<user>.cindex-refresh` LaunchAgent run an incremental `cindex refresh` over every code folder in `~/Workspace` at login and daily at 09:00 — pure shell, no Claude session involved. Sweep log: `~/.claude/code-index/logs/cron.log`.
 
 Install: `cp cindex ~/.local/bin/` (or symlink). Pure Python 3, no dependencies.
 
@@ -224,7 +224,7 @@ csession school onboarding        # find past sessions by task/topic
 csession list -n 15               # recent sessions: when, project, task, ~tokens
 csession show 59f3a355            # one session: tasks asked, files edited, resume cmd
 csession brief 59f3a355 | pbcopy  # context digest → paste into a fresh `claude`
-csession suggest "continue the NAV-10083 work"   # resume vs new, with the command
+csession suggest "continue the PROJ-1234 work"   # resume vs new, with the command
 csession journal --days 7         # combined work journal
 csession prune --days 45          # cleanup candidates (add --apply to delete)
 ```
@@ -263,11 +263,11 @@ src/services/loginService.ts:17               class LoginService
 
 ```
 $ dbindex token_hash
-prod-postgres-db/iamdb   public.account_tokens.token_hash   character varying
-stg-postgres-db/iamdb    public.account_tokens.token_hash   character varying
+prod-postgres-db/authdb   public.account_tokens.token_hash   character varying
+stg-postgres-db/authdb    public.account_tokens.token_hash   character varying
 
 $ dbindex table sessions
-prod-postgres-db/iamdb  public.user_sessions
+prod-postgres-db/authdb  public.user_sessions
     id  uuid
     user_id  character varying
     expires_at  timestamp with time zone
