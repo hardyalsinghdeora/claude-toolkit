@@ -2,9 +2,13 @@
 # (folder READMEs and the example skill are kept as reference)
 Output/*
 !Output/README.md
+!Output/worklog/
+Output/worklog/*
+!Output/worklog/README.md
 Skill/*
 !Skill/README.md
 !Skill/_example/
+!Skill/worklog/
 automation/pr-dashboard-prompt.md
 
 # --- usage data & logs

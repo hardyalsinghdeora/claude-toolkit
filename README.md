@@ -10,6 +10,8 @@ Small, dependency-free CLI tools that make AI coding sessions (Claude Code) safe
 - **dbindex** — schema index of every vault DB connection (databases → tables → columns), so "which table holds X" is answered offline with no VPN, connection, or token cost
 - **csession** — task-level index of all Claude Code sessions: find past work, resume-vs-new-session suggestions, compact context briefs, combined work journal, safe pruning
 
+- **worklog** (`Scripts/worklog/`) — zero-token daily work logs: auto-generated at login and 21:15 from the csession index + git commits (sessions, commits, files touched, improvement flags), backfilling the last 7 days so weekends/leave need no bookkeeping; `worklog week` aggregates for reports, and the `worklog` skill layers AI narrative and coaching on top. See `Output/worklog/README.md` for the file format.
+
 Plus `Scripts/atlassian/atl` — an offline Jira/Confluence fetcher (JQL search, sprint issues, fix-version resolution, page-to-plain-text, accountId lookup, issue creation) authenticated via a `jira-api-token` claude-vault entry. The `Skill/` workflows call it instead of the Atlassian MCP, turning schema-heavy MCP round-trips into compact TSV/text.
 
 How these fit together — and the manual habits they can't replace — is in [docs/token-optimization.md](docs/token-optimization.md).
