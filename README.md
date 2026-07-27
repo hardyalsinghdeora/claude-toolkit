@@ -233,6 +233,83 @@ csession prune --days 45          # cleanup candidates (add --apply to delete)
 
 Install: `cp csession ~/.local/bin/` (or symlink). Pure Python 3, no dependencies.
 
+## Examples — what a session actually looks like
+
+All samples below are sanitized/generic; real outputs stay on the local machine (see *Local-only directories*).
+
+**squeeze** — a 5,000-line test log enters the transcript as ~20 lines; the buried failure survives:
+
+```
+$ squeeze -- npm test
+INFO processing case 1
+…
+··· 4,981 lines elided (1 matching lines kept below) ···
+  L2501: ERROR: connection refused at row 2500
+INFO processing case 5000
+squeeze: 123,931 → 570 bytes (≈31.0k → ≈142 tokens, 100% saved)   # ← stderr report
+```
+
+**cindex** — "where is the login logic?" costs a handful of lines instead of a grep dump:
+
+```
+$ cindex login
+src/dal/interface/ILoginTokenRepository.ts:3  interface ILoginTokenRepository
+src/dal/login.repository.ts:8                 class LoginTokenRepository
+src/dal/queries.sql:130                       table login_tokens
+src/services/loginService.ts:17               class LoginService
+```
+
+**dbindex** — schema questions answered offline, across every environment at once:
+
+```
+$ dbindex token_hash
+prod-postgres-db/iamdb   public.account_tokens.token_hash   character varying
+stg-postgres-db/iamdb    public.account_tokens.token_hash   character varying
+
+$ dbindex table sessions
+prod-postgres-db/iamdb  public.user_sessions
+    id  uuid
+    user_id  character varying
+    expires_at  timestamp with time zone
+```
+
+**csession** — the resume-vs-new decision, priced in tokens:
+
+```
+$ csession suggest "continue the report-builder work"
+  related: 2026-07-27 08:42  ef8baee3  myproject  ~220k tok  Implement report builder
+recommendation: START NEW, seeded with a brief — related session found but
+~220k-token transcript; resuming would replay it all into context.
+  csession brief ef8baee3 | pbcopy   # then paste into:  claude
+
+$ csession journal --days 7
+2026-07-27
+  09:31  myproject   Review onboarding module task  (2 tasks, ~40k tok)
+  08:42  myproject   Implement report builder       (8 tasks, ~220k tok)
+```
+
+**atl** — a Jira sprint query as TSV instead of an MCP JSON payload:
+
+```
+$ Scripts/atlassian/atl sprint "Sprint 42" --mine
+PROJ-101  Review       Task  A. Developer  API for visit summary service
+PROJ-102  Ready for QA Task  A. Developer  Route-level unit tests for module APIs
+# 2 issues: Ready for QA=1, Review=1
+```
+
+## Local-only directories (never committed)
+
+The tools separate **engine** (committed, generic) from **work product** (local, personal). `.gitignore` and `.claudeignore` enforce it:
+
+| Path | Holds | Why local-only |
+|---|---|---|
+| `Output/` | Generated reports, PR reviews, dashboards, SQL deliverables | Company/task data |
+| `Skill/` | Personal workflow skills (PR review conventions, sprint reports…) | Encodes employer-specific process |
+| `*.log`, `logs/` | Tool/automation run logs | Usage history |
+| `.env`, `*.env` | Local config | Secrets belong in `claude-vault` |
+
+Index data never lives in any repo at all — it goes to `~/.claude/{code-index,db-index,session-index}/`, each with an `indexes/` + `logs/` pair. `.claudeignore` additionally keeps these categories out of the AI-searchable code index even where they exist on disk.
+
 ## Notes
 
 - Changes take effect in **new** Claude Code sessions, not ones already running.
