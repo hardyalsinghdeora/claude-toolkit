@@ -11,6 +11,9 @@ employer-specific process, names, and URLs.
 Skill/
 ├── _example/SKILL.md     # committed: generic template showing the conventions
 ├── pr-review/SKILL.md    # local: review a PR → Output/Review/<repo>/<pr>.md
+├── standards-pr-review/   # local: house-standards 5-axis review
+│   ├── SKILL.md           #        → Output/Standards-Review/<repo>/<pr>.md
+│   └── references/standards-digest.md
 ├── sprint-retro/SKILL.md # local: my sprint retrospective → Output/Retro/
 ├── sprint-briefing/…     # local: squad monthly briefing → Output/Report/
 ├── build-release-email/… # local: release mail from a Jira version URL

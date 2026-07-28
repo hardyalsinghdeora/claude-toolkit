@@ -9,8 +9,11 @@ Skill/*
 !Skill/README.md
 !Skill/_example/
 !Skill/worklog/
-automation/pr-*
-automation/.cache/
+# automation/ is allowlisted: anything dropped in here is local until it is
+# explicitly un-ignored, so workplace-specific jobs can never be staged by accident
+automation/*
+!automation/cindex-refresh.sh
+!automation/launchd/
 
 # --- usage data & logs
 *.log

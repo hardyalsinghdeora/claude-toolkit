@@ -159,7 +159,7 @@ Extract Jira ticket IDs (`NAV-\d+` etc.) from branch names at index time so `cin
 Method extraction for Java/Kotlin/C# is heuristic and C/C++ only gets types. Consider optional ctags integration when `universal-ctags` is installed (keep the regex fallback so the tool stays dependency-free).
 
 ### X4. `grep` via ripgrep — **P3, small**
-`cindex grep` shells to `grep` per 200-file chunk; use `rg --files-from` when available for speed on the big repos (a large front-end repo: 2.6k files).
+`cindex grep` shells to `grep` per 200-file chunk; use `rg --files-from` when available for speed on the big repos (a 2.6k-file front-end repo).
 
 ## dbindex (new 2026-07-27)
 
