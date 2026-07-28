@@ -1,6 +1,6 @@
 # Enhancement Plan — claude-toolkit
 
-_Drafted 2026-07-17 for `claude-vault`, `claude-toggle`, `core-db` (now `db-conn`). Extended 2026-07-27 as the token-optimization suite shipped: `squeeze` 1.0, `cindex` 1.3 (incl. `.claudeignore` support), `dbindex` 1.0, `csession` 1.0, the `claude-toggle` directive system (1.4.1, blocks compressed to ~28 CLAUDE.md lines), the `com.example.cindex-refresh` launchd sweep, `Scripts/atlassian/atl` (offline Jira/Confluence fetcher, live-verified), skills `sprint-briefing` + `build-release-email` ported from Promt, and `docs/token-optimization.md`._
+_Drafted 2026-07-17 for `claude-vault`, `claude-toggle`, `core-db` (now `db-conn`). Extended 2026-07-27 as the token-optimization suite shipped: `squeeze` 1.0, `cindex` 1.3 (incl. `.claudeignore` support), `dbindex` 1.0, `csession` 1.0, the `claude-toggle` directive system (1.4.1, blocks compressed to ~28 CLAUDE.md lines), the cindex-refresh launchd sweep, `Scripts/atlassian/atl` (offline Jira/Confluence fetcher, live-verified), skills `sprint-briefing` + `build-release-email` ported from Promt, and `docs/token-optimization.md`._
 
 ## Real scenarios that motivated this plan
 
@@ -22,6 +22,9 @@ These all happened in practice and each maps to a feature below:
 | S12 | Directive text lives in `claude-toggle` source; a wording improvement in a newer version never reaches an already-enabled block in `CLAUDE.md` — the 2026-07-27 directive compression needed manual off+on ×4 | T9 directive refresh |
 | S13 | Jira answers a bad-auth JQL search with **HTTP 200 and zero issues** (anonymous degradation) instead of an error — `atl` looked "working but empty" until `/myself` was checked | A2 identity guard (partially fixed: gateway mode persisted in atl-cache) |
 | S14 | Atlassian **scoped** API tokens 401 on the site URL (work only via `api.atlassian.com/ex/<product>/<cloudId>`) and are product-scoped — the Jira token couldn't read Confluence | (fixed 2026-07-27: gateway fallback + path-aware token choice) |
+| S15 | A scheduled headless tick hung 91 min with no output and had to be killed (2026-07-28). The only way to stop the *schedule* was `launchctl bootout` — after which the job is indistinguishable, to `toolkit doctor` and to the user, from a broken install. Two weeks later nobody would know it was paused on purpose | G4 pause/resume with state |
+| S16 | The plists exist only in `~/Library/LaunchAgents/` — nothing in the repo, and launchd will not expand `~` inside one. `toolkit install` relinks all 9 binaries but cannot (re)create an agent, so an S10-style repo move leaves plists pointing at dead paths with no source of truth to re-render from | G5 versioned plist templates |
+| S17 | The public repo carried the employer's Jira tenant + a work email hardcoded in `Scripts/atlassian/atl`, an internal MCP server name in `docs/launch-agent.md`, and a `$HOME` username in `csession` — pushed across 8 commits before anyone looked (2026-07-28) | (fixed 2026-07-28: config moved to `~/.claude/atl-config.json`; **history rewrite still outstanding**) |
 
 ---
 
@@ -228,6 +231,36 @@ S10 (all symlinks dead for days) needs a guard: an `install.sh` that (re)links e
 ### G3. ~~Commit the suite~~ — **done 2026-07-27** (pushed to github.com/hardyalsinghdeora/claude-toolkit)
 The four new tools, automation/, and the doc updates are uncommitted (`git status` shows them untracked). Commit as the "token-optimization suite" milestone.
 
+### G4. `toolkit agents` — one control surface for the launchd jobs — **P1, medium**
+
+Today `toolkit doctor` only *reports* whether an agent is loaded; every actual operation is a hand-typed `launchctl` incantation, and the modern (`bootstrap`/`bootout`/`kickstart`) and legacy (`load`/`unload`/`start`) spellings are mixed across `docs/launch-agent.md` and muscle memory. Two jobs run off this repo — `cindex-refresh` (daily 09:00) and `worklog` (daily 21:15), both local-only and token-free.
+
+Neither is expensive, so the case for the command is not cost, it is **legibility**: pause is a two-command sequence that is easy to get half-right, and a half-right pause is indistinguishable from a broken install (S15).
+
+`toolkit agents <verb>`, wrapping the correct `gui/$(id -u)` domain calls:
+
+| Verb | Does | Wraps |
+|---|---|---|
+| `list` / `status` | table: loaded? enabled? next run, `runs`, `last exit code`, log mtime, paused-since | `launchctl print` + `print-disabled` |
+| `run <label>` | fire one tick now, tail the log | `kickstart -k gui/$(id -u)/<label>` |
+| `pause <label> [--until 18:00\|--for 4h]` | stop the schedule *and* record why/when in `~/.claude/toolkit-agents.json` | `bootout` **+** `disable` |
+| `resume <label>` | undo the above without a surprise `RunAtLoad` tick | `enable` **+** `bootstrap`, then re-arm |
+| `stop <label>` | kill the *currently running* tick, leave the schedule intact | `kill TERM gui/$(id -u)/<label>` |
+| `logs <label> [-f]` | tail the right file (they do not live in one place) | — |
+| `every <label> <spec>` | re-render the schedule (`daily 09:00`, `hourly 9-18`, `30m`) and reload | rewrite plist + `bootout`/`bootstrap` |
+
+Design notes worth encoding, because each is a mistake already made or narrowly avoided:
+- **`disable` alone does not stop a loaded job**, and `bootout` alone does not survive login. Only the *pair* is a real pause — this is the single biggest reason to have the command.
+- **Pause needs state.** Without the `paused-since / reason / until` record, S15 recurs: `doctor` shows WARN "not loaded" and nobody can tell deliberate from broken. `doctor` should read that file and print `paused (2026-07-28, hung run) — resume with 'toolkit agents resume <label>'` instead of a false alarm.
+- **`RunAtLoad` + `bootstrap` = an unintended immediate run.** `resume` should either strip `RunAtLoad` for the reload or say plainly that a tick is about to fire.
+- **`--until`** can't rely on launchd alone; the cheapest honest implementation is for `resume` to be checked opportunistically (on the next `toolkit doctor` / `agents list`), not to promise a wake-up.
+
+### G5. Versioned plist templates + `toolkit agents install` — **P1, small**
+
+The plists are untracked one-offs in `~/Library/LaunchAgents/` (S16), and launchd does not expand `~` or `$HOME` inside a plist, so every one of them hardcodes an absolute path that a repo move invalidates. Add `automation/launchd/*.plist.tmpl` with `{{REPO}}`/`{{HOME}}`/`{{SCHEDULE}}` placeholders, and `toolkit agents install [<label>] [--dry-run]` that renders and bootstraps them — the same idempotent contract `toolkit install` already has for the 9 symlinks. Then a repo move is one command (`toolkit install && toolkit agents install`) instead of hand-edited XML, and `doctor` can diff live plist vs template and flag drift. Pairs with G1.
+
+_(G6, a watchdog for headless `claude -p` agents, was dropped on 2026-07-28 when the pr-dashboard automation was removed from the repo — no scheduled job now runs a model. The requirement survives as a Gotcha in `docs/launch-agent.md`: launchd has no per-job timeout, so any future job that calls a model or the network needs its own `timeout` plus a lockfile in the wrapper.)_
+
 ---
 
 ## Suggested order of work
@@ -244,6 +277,11 @@ After this, credentials are verifiable, importable without chat-pasting, and inj
 
 **Phase 4 — token-optimization suite hardening: ✅ core done 2026-07-27** — G1, G3, A1, A2, A3, T9, T10, X1, X2, D1, N1, N3, Q1 (new `toolkit` CLI; claude-toggle 1.7.0, cindex 1.4.0, dbindex 1.1.0, csession 1.1.0, squeeze 1.1.0, atl 1.1.0, db-conn 1.2.0).
 Still open, deliberately (no friction yet): G2 shared helpers, A4 Bitbucket `bbt` + K2, A5 backoff, K1 skill dedup, Q2 profiles, X3/X4, D2/D3/D4, N2/N4, T11.
+
+**Phase 5 — scheduled-agent control (opened 2026-07-28, not started):** G4 `toolkit agents`, then G5 versioned plists.
+Trigger: S15/S16 — a job stopped by a raw `bootout` sits in a state `doctor` reports as a fault, and the plists have no source of truth. G4 first (it makes agent state legible and reversible), G5 second (removes the untracked-plist liability). G6 was dropped with the pr-dashboard removal.
+
+**Hygiene — public-repo scrub (2026-07-28):** the pr-dashboard automation was deleted from the repo and the hardcoded tenant/email/username removed (S17). The **git history still contains them** in commits `1af84b3`..`5a8eb78`, already pushed to `origin` and possibly to the `private-old` remote — a history rewrite + force-push is the outstanding half, and needs an explicit decision because it invalidates every existing clone.
 
 Original order of work:
 1. **G3 commit the suite** (still pending — now also covers atl, skills, ignore files, docs) + **G1 doctor/install** — S10 must not happen again; everything else builds on a healthy install.

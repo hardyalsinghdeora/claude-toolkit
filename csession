@@ -67,7 +67,15 @@ def log(msg):
 
 
 def decode_project(dirname):
-    return dirname.replace("-", "/").replace("/Users/you", "/Users/you")
+    # Claude encodes a project path by replacing every '/' and '.' with '-',
+    # which is lossy — '/Users/a.b' and '/Users/a/b' encode identically. Recover
+    # the home prefix from the real $HOME rather than hardcoding a username.
+    path = dirname.replace("-", "/")
+    home = str(Path.home())
+    flattened = home.replace(".", "/")
+    if flattened != home and path.startswith(flattened):
+        path = home + path[len(flattened):]
+    return path
 
 
 def clean_text(c):

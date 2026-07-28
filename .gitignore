@@ -9,7 +9,7 @@ Skill/*
 !Skill/README.md
 !Skill/_example/
 !Skill/worklog/
-automation/pr-dashboard-prompt.md
+automation/pr-*
 
 # --- usage data & logs
 *.log

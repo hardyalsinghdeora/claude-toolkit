@@ -12,9 +12,9 @@
 Examples:
 
 ```
-/loop 30m refresh my PR dashboard and review new arrivals dry-run
+/loop 30m refresh the status dashboard and summarise what changed
 /loop 5m check whether the deploy finished
-/loop keep an eye on my open PRs        # Claude picks the cadence itself
+/loop keep an eye on the build            # Claude picks the cadence itself
 ```
 
 ## Two modes
@@ -32,10 +32,10 @@ Ask Claude to stop the loop, or interrupt and say so — it cancels the underlyi
 - Runs consume tokens on every iteration — prefer the longest interval that still meets the need.
 - For anything that must outlive the session, use a launchd LaunchAgent (`launch-agent.md`).
 
-## Relation to the PR dashboard
+## Three ways to run the same recurring prompt
 
-"Yesterday's loop" for the PR dashboard was this pattern: a 30-minute recurring refresh of `Workspace/Claude/Output/my-open-prs.md` with dry-run reviews of new PRs. Equivalent ways to start it:
+For a periodic refresh that writes a file under `Output/`, all three work — they differ only in how long they survive:
 
-- `/loop 30m <refresh prompt>` — quickest from the keyboard.
-- Ask Claude to create the session cron job directly (current setup, job `77b7bf8c`, `11,41 * * * *`).
-- launchd LaunchAgent — the only variant that starts by itself when the laptop boots.
+- `/loop 30m <refresh prompt>` — quickest from the keyboard; dies with the session.
+- A session cron job (`docs/cron-jobs.md`) — same lifetime, but the schedule is explicit and listable.
+- A launchd LaunchAgent (`docs/launch-agent.md`) — the only variant that starts by itself when the laptop boots.

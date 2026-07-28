@@ -3,9 +3,12 @@
 #
 # Replaces Atlassian MCP round-trips (schema loading + verbose JSON) with
 # direct REST calls and COMPACT output. Auth: Jira API token from claude-vault
-# (`jira-api-token`), email from vault (`jira-email`) or the built-in default.
+# (`jira-api-token`); site + account email from ~/.claude/atl-config.json
+# (or ATL_SITE / ATL_EMAIL) — deliberately not hardcoded, this repo is public.
 # Setup once:  claude-vault set jira-api-token --desc "Jira API token"
 #              (create at id.atlassian.com → Security → API tokens)
+#              echo '{"site":"https://<site>.atlassian.net","email":"you@example.com"}' \
+#                > ~/.claude/atl-config.json
 #
 # Usage:
 #   atl jql "<JQL>" [--limit N] [--desc] [--json]   # issues, compact TSV
@@ -13,7 +16,7 @@
 #   atl version <jira-release-url>                  # fix-version name, date + issues
 #   atl user "<display name>"                       # accountId lookup
 #   atl page <confluence-url-or-page-id>            # page as plain text (capped)
-#   atl create --project NAV --type Task --summary "..." [--description "..."]
+#   atl create --project PROJ --type Task --summary "..." [--description "..."]
 #                                                   [--dry-run]  # print the payload only
 #   atl whoami                                      # verify which account the token is
 #
@@ -21,6 +24,7 @@
 
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
@@ -30,16 +34,47 @@ import urllib.request
 from html import unescape
 from pathlib import Path
 
-VERSION = "1.1.0"
-SITE = "https://your-site.atlassian.net"
-DEFAULT_EMAIL = "you@example.com"
+VERSION = "1.2.0"
 PAGE_CHAR_CAP = 15000
+# Which tenant this talks to is deployment-specific and stays out of the repo:
+# ATL_SITE / ATL_EMAIL win, then ~/.claude/atl-config.json, then vault.
+CONFIG_PATH = Path.home() / ".claude" / "atl-config.json"
 FIELDS = "summary,status,issuetype,assignee,updated,fixVersions"
 
 
 def vault(name):
     r = subprocess.run(["claude-vault", "get", name], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _config():
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except (OSError, ValueError):
+            cfg = {}
+    return cfg
+
+
+SETUP_HINT = (
+    "atl: no Atlassian site configured.\n"
+    f"  write {CONFIG_PATH}:\n"
+    '    {"site": "https://<your-site>.atlassian.net", "email": "you@example.com"}\n'
+    "  (or export ATL_SITE / ATL_EMAIL)"
+)
+
+
+def site():
+    s = os.environ.get("ATL_SITE") or _config().get("site")
+    if not s:
+        sys.exit(SETUP_HINT)
+    return s.rstrip("/")
+
+
+def account_email():
+    return (os.environ.get("ATL_EMAIL") or _config().get("email")
+            or vault("jira-email"))
 
 
 def auth_header(path="/"):
@@ -52,7 +87,9 @@ def auth_header(path="/"):
         sys.exit("atl: no 'jira-api-token' or 'confluence-token' in claude-vault.\n"
                  "  create one at id.atlassian.com → Security → API tokens, then:\n"
                  "  claude-vault set jira-api-token --desc 'Jira API token'")
-    email = vault("jira-email") or DEFAULT_EMAIL
+    email = account_email()
+    if not email:
+        sys.exit(SETUP_HINT)
     b64 = base64.b64encode(f"{email}:{token}".encode()).decode()
     return {"Authorization": f"Basic {b64}", "Accept": "application/json",
             "Content-Type": "application/json"}
@@ -76,7 +113,7 @@ def save_cache():
 
 def cloud_id():
     if not _state["cloudid"]:
-        with urllib.request.urlopen(SITE + "/_edge/tenant_info", timeout=15) as r:
+        with urllib.request.urlopen(site() + "/_edge/tenant_info", timeout=15) as r:
             _state["cloudid"] = json.loads(r.read())["cloudId"]
         save_cache()
     return _state["cloudid"]
@@ -99,7 +136,7 @@ def do_request(url, payload, method, path="/"):
 
 
 def call(path, payload=None, method=None, soft=False):
-    urls = [SITE + path, gateway_url(path)]
+    urls = [site() + path, gateway_url(path)]
     if _state["gateway"]:
         urls = urls[1:]
     last = None
@@ -285,7 +322,7 @@ def cmd_create(opts):
             sys.exit("atl: credentials do not authenticate — creation would fail")
         return
     data = call("/rest/api/3/issue", {"fields": fields})
-    print(f"created {data.get('key')}  {SITE}/browse/{data.get('key')}")
+    print(f"created {data.get('key')}  {site()}/browse/{data.get('key')}")
 
 
 def main():

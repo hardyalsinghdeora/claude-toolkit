@@ -1,25 +1,24 @@
-# launchd LaunchAgent — Run the PR Dashboard at Laptop Startup
+# launchd LaunchAgents — scheduled jobs that outlive the session
 
-macOS-native way to run the 30-minute PR dashboard refresh **whenever the laptop is on**, independent of any open Claude Code session. This is the answer to "how do I get this started whenever my laptop starts" — session cron jobs and `/loop` both die with the session.
+macOS-native way to run toolkit jobs **whenever the laptop is on**, independent of any open Claude Code session. This is the answer to "how do I get this started whenever my laptop starts" — session cron jobs (`docs/cron-jobs.md`) and `/loop` (`docs/loop.md`) both die with the session.
 
-> Status: **proposed, not yet installed** (setup was paused on 2026-07-15 pending the your-mcp-gateway vs. Atlassian Bitbucket access decision).
+## Current agents
+
+| Label | Runs | Schedule | Log |
+|---|---|---|---|
+| `com.<you>.cindex-refresh` | `automation/cindex-refresh.sh` | daily 09:00 + at load | `~/.claude/code-index/logs/launchd.log` |
+| `com.<you>.worklog` | `Scripts/worklog/worklog check` | daily 21:15 + at load | `~/.claude/code-index/logs/worklog-launchd.log` |
+
+Both are local-only and cost no tokens — an mtime-incremental index sweep and a work-log rollup. Agents that run a headless `claude -p` session per tick are possible but **bill on every tick**; treat that as a deliberate choice, bound the schedule tightly, and read the watchdog note under Gotchas first.
+
+The plists live in `~/Library/LaunchAgents/` and are **not tracked in this repo** — see G4/G5 in `ENHANCEMENTS.md` for the planned `toolkit agents` wrapper and versioned templates.
 
 ## How it works
 
 - A **LaunchAgent** is a plist in `~/Library/LaunchAgents/` that launchd (macOS's service manager) runs on your behalf while you're logged in.
-- `RunAtLoad = true` → fires once at login/boot.
-- `StartInterval = 1800` → fires again every 30 minutes after that.
-- Each tick runs `claude -p "<prompt>"` — a fresh **headless** Claude Code session that refreshes the dashboard and exits. No window needs to be open.
+- `RunAtLoad = true` → fires once at login/boot **and on every `bootstrap`**.
+- `StartInterval = 1800` → fires every 30 minutes; `StartCalendarInterval` instead pins it to wall-clock times (a dict, or an array of dicts for several times a day). Omitted keys mean "every" — a bare `{Minute: 0}` is hourly, all day.
 - If the laptop is asleep at a tick, launchd coalesces missed runs into one when it wakes.
-
-## Proposed layout
-
-| File | Purpose |
-|---|---|
-| `~/Workspace/Claude/automation/pr-dashboard-prompt.md` | The refresh prompt (same content as the session cron prompt — see `cron-jobs.md`) |
-| `~/Workspace/Claude/automation/pr-dashboard-refresh.sh` | Wrapper script: runs `claude -p "$(cat pr-dashboard-prompt.md)"` with the needed flags |
-| `~/Library/LaunchAgents/com.example.pr-dashboard.plist` | The LaunchAgent definition |
-| `~/Workspace/Claude/automation/pr-dashboard.log` | stdout/stderr from each run |
 
 ## Example plist
 
@@ -30,66 +29,97 @@ macOS-native way to run the 30-minute PR dashboard refresh **whenever the laptop
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.pr-dashboard</string>
+  <string>com.example.myjob</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/you/Workspace/Claude/automation/pr-dashboard-refresh.sh</string>
+    <string>/Users/YOU/Workspace/Claude-toolkit/automation/myjob.sh</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/YOU/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>1800</integer>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
   <key>StandardOutPath</key>
-  <string>/Users/you/Workspace/Claude/automation/pr-dashboard.log</string>
+  <string>/Users/YOU/.claude/code-index/logs/myjob.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/you/Workspace/Claude/automation/pr-dashboard.log</string>
+  <string>/Users/YOU/.claude/code-index/logs/myjob.log</string>
 </dict>
 </plist>
 ```
 
-## Example wrapper script
-
-```sh
-#!/bin/zsh
-# pr-dashboard-refresh.sh — headless PR dashboard refresh
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-cd "$HOME"
-claude -p "$(cat "$HOME/Workspace/Claude/automation/pr-dashboard-prompt.md")" \
-  --allowedTools "Read,Write,Edit,Glob,Grep,mcp__your-gateway__mcp_search_tools,mcp__your-gateway__mcp_get_tool_schema,mcp__your-gateway__mcp_call_tool" \
-  >> "$HOME/Workspace/Claude/automation/pr-dashboard.log" 2>&1
-```
-
-Notes:
-
-- launchd does not load your shell profile — the script must set `PATH` itself (the `claude` binary lives at `~/.local/bin/claude`).
-- `--allowedTools` pre-approves only the tools the job needs, so the headless run never blocks on a permission prompt. Swap the `mcp__your-gateway__*` entries for the Atlassian Bitbucket MCP tools if/when that migration happens.
-- The your-mcp-gateway is an HTTP MCP server in user-level config, so headless runs can reach it (verified 2026-07-15). Interactively-authenticated claude.ai connectors (Rovo, Zoho) are **not** available headless.
+launchd does not expand `~` or `$HOME` in a plist — absolute paths only, which is exactly why G5 wants these rendered from templates rather than hand-edited.
 
 ## Install / manage
 
+`load`/`unload`/`start` are the legacy spellings; on current macOS use the domain-target form. `L` = the label, `P` = its plist path:
+
 ```sh
-# install (after creating the three files)
-launchctl load ~/Library/LaunchAgents/com.example.pr-dashboard.plist
-
-# check it's registered
-launchctl list | grep pr-dashboard
-
-# trigger a run right now (test)
-launchctl start com.example.pr-dashboard
-
-# watch the log
-tail -f ~/Workspace/Claude/automation/pr-dashboard.log
-
-# uninstall
-launchctl unload ~/Library/LaunchAgents/com.example.pr-dashboard.plist
-rm ~/Library/LaunchAgents/com.example.pr-dashboard.plist
+L=com.example.myjob; P=~/Library/LaunchAgents/$L.plist; D=gui/$(id -u)
 ```
 
-(On newer macOS, `launchctl bootstrap gui/$(id -u) <plist>` / `bootout` are the modern equivalents of load/unload.)
+**Start / install (arm the schedule)**
+```sh
+launchctl enable $D/$L          # clear a persisted disable override, if it was paused before
+launchctl bootstrap $D "$P"     # register + arm; RunAtLoad fires one run IMMEDIATELY
+```
 
-## Caveats
+**Status — is it armed, when does it run next, did it fail?**
+```sh
+launchctl list | grep example                     # quick: PID, last exit code, label
+launchctl print $D/$L | grep -E 'state|runs|last exit code|path'
+launchctl print-disabled $D | grep example        # persisted disable overrides
+```
+`launchctl list` shows `-` for PID when not running; the middle column is the **last exit code**. A label missing from `list` entirely is not loaded at all.
 
-- Each tick is a fresh headless Claude session and **bills tokens** — ~48 runs/day at 30-min cadence. Consider `StartInterval 3600` (hourly) if that's too much.
-- Avoid double-running: if a session cron job for the dashboard is active in an open Claude Code window at the same time, both will write the dashboard file. Delete the session job once the LaunchAgent is installed.
-- LaunchAgents run only while you're logged in (that's what we want here — Keychain and user config are available).
+**Manual run — fire one tick right now**
+```sh
+launchctl kickstart -k $D/$L    # -k restarts it if a tick is already running
+```
+Runs it on the spot and leaves the schedule untouched. Prefer it over the legacy `launchctl start`.
+
+**Stop the *current run* (keep the schedule)**
+```sh
+launchctl kill TERM $D/$L       # SIGKILL if it ignores TERM
+```
+Reach for this when a tick hangs — the next scheduled tick still happens.
+
+**Pause the *schedule*** — both halves are required:
+```sh
+launchctl bootout $D/$L         # unload now (does NOT survive login on its own)
+launchctl disable $D/$L         # persist across login (does NOT stop a loaded job on its own)
+```
+`bootout` alone = paused until next login. `disable` alone = still runs this session. Only the pair is a real pause.
+
+**Resume**
+```sh
+launchctl enable $D/$L          # must come first — bootstrap on a disabled label is a no-op
+launchctl bootstrap $D "$P"     # ⚠ RunAtLoad means this fires a run immediately
+```
+
+**Change the timing** — edit the plist, then reload (launchd caches the loaded copy, so editing alone does nothing):
+```sh
+plutil -lint "$P"               # validate the XML first
+launchctl bootout $D/$L && launchctl bootstrap $D "$P"
+```
+
+**Uninstall**
+```sh
+launchctl bootout $D/$L; rm "$P"
+```
+
+## Gotchas that have actually bitten
+
+- **`bootstrap` fires an immediate run** whenever `RunAtLoad` is true — costly if the job is a headless model session. Set it false while you are only editing the schedule.
+- **A paused job looks identical to a broken one.** `toolkit doctor` reports `not loaded — launchctl bootstrap ...` whether you paused it deliberately or the install rotted after a repo move (S10). Until G4 lands, leave a note when you pause something.
+- **launchd has no per-job timeout.** A hung tick runs forever — a headless refresh job once idled 91 minutes before being killed by hand. Any job that calls out to the network or a model needs its own `timeout` in the wrapper script, plus a lockfile so a slow tick cannot overlap the next one.
+- **launchd does not load your shell profile** — set `PATH` in `EnvironmentVariables` or in the script itself. Tools installed by `toolkit install` live in `~/.local/bin`.
+- **Interactively-authenticated MCP connectors are unavailable headless.** Only HTTP/stdio MCP servers configured at user level are reachable from a `claude -p` run; anything that needed a browser login in an interactive session will not be there.
+- LaunchAgents run only while you are logged in — which is what you want here, since Keychain (and therefore `claude-vault`) is only unlocked then.

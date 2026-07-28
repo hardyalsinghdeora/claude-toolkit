@@ -1,6 +1,6 @@
 #!/bin/zsh
 # cindex-refresh.sh — rebuild cindex indexes for every code folder in
-# ~/Workspace, driven by launchd (com.example.cindex-refresh). Pure shell:
+# ~/Workspace, driven by a launchd agent. Pure shell:
 # no Claude session is involved, so a run costs zero tokens.
 #
 # A folder counts as code if it has .git, or contains at least one source
