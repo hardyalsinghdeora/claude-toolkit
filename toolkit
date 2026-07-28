@@ -11,21 +11,27 @@
 #   toolkit doctor                # verify links, versions, PATH, launchd agents,
 #                                 #   directive freshness, indexes, vault health
 #   toolkit list                  # the tools this repo provides
+#   toolkit agents <verb>         # control the launchd jobs — see 'agents help'
 #
 # doctor exits non-zero when something is broken, so it can gate automation.
 
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = Path(__file__).resolve().parent
 DEFAULT_BIN = Path.home() / ".local" / "bin"
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+AGENT_MANIFEST = REPO / "automation" / "launchd" / "agents.json"
+AGENT_STATE = Path.home() / ".claude" / "toolkit-agents.json"
+DEFAULT_PREFIX = "com.claude-toolkit"
 
 # name -> path within the repo
 TOOLS = {
@@ -114,8 +120,68 @@ def check_tools(bin_dir):
 
 def check_agents():
     rows, bad = [], 0
+    state = load_state()
+    expire_pauses(state, quiet=True)
+    paused = state.get("paused", {})
+    installed = repo_plists()
+    for label, plist in sorted(installed.items()):
+        text = plist.read_text(errors="ignore")
+        script = re.search(r"<string>([^<]*" + re.escape(str(REPO)) + r"[^<]*)</string>", text)
+        if script and not Path(script.group(1)).exists():
+            rows.append((BAD, label, f"plist points at a missing script: {script.group(1)}")); bad += 1
+            continue
+        short = label.rsplit(".", 1)[-1]
+        loaded = sh(["launchctl", "list", label])[0] == 0
+        if label in paused:
+            # A deliberate pause is not a fault — this is the whole point of
+            # recording it (S15: bootout is indistinguishable from a rotted install).
+            rec = paused[label]
+            why = rec.get("reason") or "no reason recorded"
+            rows.append((OK, label, f"paused {rec.get('since', '')[:10]} ({why}) — "
+                                    f"'toolkit agents resume {short}'"))
+        elif loaded:
+            msg = "loaded"
+            if plist_drift(label, plist):
+                msg += " — differs from the manifest ('toolkit agents install')"
+            rows.append((OK if msg == "loaded" else WARN, label, msg))
+        else:
+            rows.append((WARN, label, f"not loaded — 'toolkit agents resume {short}'"))
+    for agent in manifest():
+        if not any(l.rsplit(".", 1)[-1] == agent["name"] for l in installed):
+            rows.append((WARN, agent["name"],
+                         f"in the manifest but not installed — "
+                         f"'toolkit agents install {agent['name']}'"))
+    return rows, bad
+
+
+# ---------------------------------------------------------------- agents ---
+# launchd's own spellings are easy to get half-right, and a half-right pause is
+# indistinguishable from a broken install. Two rules drive everything here:
+#   * `bootout` alone does not survive login; `disable` alone does not stop a
+#     loaded job. Only the pair is a real pause.
+#   * a deliberate pause must leave a record, or `doctor` reports it as a fault.
+
+def domain():
+    return f"gui/{os.getuid()}"
+
+
+def load_state():
+    try:
+        return json.loads(AGENT_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    AGENT_STATE.parent.mkdir(parents=True, exist_ok=True)
+    AGENT_STATE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def repo_plists():
+    """label -> plist path, for every LaunchAgent that references this repo."""
+    found = {}
     if not LAUNCH_AGENTS.exists():
-        return rows, bad
+        return found
     for plist in sorted(LAUNCH_AGENTS.glob("*.plist")):
         try:
             text = plist.read_text(errors="ignore")
@@ -124,17 +190,414 @@ def check_agents():
         if str(REPO) not in text:
             continue
         m = re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", text)
-        label = m.group(1) if m else plist.stem
-        script = re.search(r"<string>([^<]*" + re.escape(str(REPO)) + r"[^<]*)</string>", text)
-        if script and not Path(script.group(1)).exists():
-            rows.append((BAD, label, f"plist points at a missing script: {script.group(1)}")); bad += 1
+        found[m.group(1) if m else plist.stem] = plist
+    return found
+
+
+def label_prefix(state):
+    if state.get("label_prefix"):
+        return state["label_prefix"]
+    # Adopt the prefix already in use rather than orphaning installed agents.
+    for label in repo_plists():
+        if "." in label:
+            return label.rsplit(".", 1)[0]
+    return DEFAULT_PREFIX
+
+
+def manifest():
+    try:
+        data = json.loads(AGENT_MANIFEST.read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"toolkit agents: cannot read {AGENT_MANIFEST}: {e}")
+    subs = {"{{REPO}}": str(REPO), "{{HOME}}": str(Path.home())}
+
+    def expand(v):
+        if isinstance(v, str):
+            for k, r in subs.items():
+                v = v.replace(k, r)
+            return v
+        if isinstance(v, list):
+            return [expand(x) for x in v]
+        if isinstance(v, dict):
+            return {k: expand(x) for k, x in v.items()}
+        return v
+
+    return [expand(a) for a in data.get("agents", [])]
+
+
+def schedule_keys(sched):
+    """Manifest schedule -> the plist key/value that expresses it."""
+    t = sched.get("type")
+    if t == "daily":
+        return {"StartCalendarInterval": {"Hour": int(sched["hour"]),
+                                          "Minute": int(sched.get("minute", 0))}}
+    if t == "hourly":
+        minute = int(sched.get("minute", 0))
+        return {"StartCalendarInterval": [{"Hour": h, "Minute": minute}
+                                          for h in range(int(sched["from"]),
+                                                         int(sched["to"]) + 1)]}
+    if t == "interval":
+        return {"StartInterval": int(sched["seconds"])}
+    sys.exit(f"toolkit agents: unknown schedule type {t!r} in the manifest")
+
+
+def describe_schedule(plist_data):
+    cal = plist_data.get("StartCalendarInterval")
+    if isinstance(cal, dict):
+        return f"daily {cal.get('Hour', 0):02d}:{cal.get('Minute', 0):02d}"
+    if isinstance(cal, list) and cal:
+        hours = sorted(c.get("Hour", 0) for c in cal)
+        minute = cal[0].get("Minute", 0)
+        contiguous = hours == list(range(hours[0], hours[-1] + 1))
+        span = f"{hours[0]}-{hours[-1]}" if contiguous else ",".join(map(str, hours))
+        return f"hourly {span} at :{minute:02d}"
+    if "StartInterval" in plist_data:
+        secs = int(plist_data["StartInterval"])
+        return f"every {secs // 60}m" if secs % 3600 else f"every {secs // 3600}h"
+    return "on load only"
+
+
+def parse_schedule_spec(words):
+    """'daily 09:00' | 'hourly 9-18' | '30m' -> a manifest schedule dict.
+
+    Accepts the spec as separate argv words or as one quoted string.
+    """
+    words = " ".join(words).split()
+    if not words:
+        sys.exit("toolkit agents every: give a schedule, e.g. 'daily 09:00', "
+                 "'hourly 9-18', '30m'")
+    head = words[0].lower()
+    if head == "daily" and len(words) > 1 and ":" in words[1]:
+        h, m = words[1].split(":", 1)
+        return {"type": "daily", "hour": int(h), "minute": int(m)}
+    if head == "hourly" and len(words) > 1 and "-" in words[1]:
+        a, b = words[1].split("-", 1)
+        return {"type": "hourly", "from": int(a), "to": int(b), "minute": 0}
+    m = re.fullmatch(r"(\d+)([smh])", head)
+    if m:
+        mult = {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+        return {"type": "interval", "seconds": int(m.group(1)) * mult}
+    sys.exit(f"toolkit agents every: cannot parse schedule {' '.join(words)!r}")
+
+
+def render_plist(agent, label):
+    data = {"Label": label, "ProgramArguments": agent["program"],
+            "RunAtLoad": bool(agent.get("run_at_load", True))}
+    data.update(schedule_keys(agent["schedule"]))
+    if agent.get("env"):
+        data["EnvironmentVariables"] = agent["env"]
+    if agent.get("log"):
+        data["StandardOutPath"] = agent["log"]
+        data["StandardErrorPath"] = agent["log"]
+    return data
+
+
+def disabled_labels():
+    code, out, _ = sh(["launchctl", "print-disabled", domain()])
+    if code != 0:
+        return set()
+    return {m.group(1) for m in re.finditer(r'"([^"]+)"\s*=>\s*disabled', out)}
+
+
+def agent_runtime(label):
+    """(loaded, runs, last_exit, running) straight from launchctl."""
+    code, out, _ = sh(["launchctl", "print", f"{domain()}/{label}"])
+    if code != 0:
+        return False, None, None, False
+    def field(name):
+        m = re.search(rf"^\s+{re.escape(name)} = (.+)$", out, re.M)
+        return m.group(1).strip() if m else None
+    return True, field("runs"), field("last exit code"), field("state") == "running"
+
+
+def resolve(name, state, need_plist=True):
+    """Accept a short name ('worklog') or a full label."""
+    plists = repo_plists()
+    if name in plists:
+        return name, plists[name]
+    matches = [l for l in plists if l.rsplit(".", 1)[-1] == name]
+    if len(matches) == 1:
+        return matches[0], plists[matches[0]]
+    if len(matches) > 1:
+        sys.exit(f"toolkit agents: '{name}' is ambiguous: {', '.join(matches)}")
+    # Not installed yet — resolve against the manifest so 'install' can work.
+    for agent in manifest():
+        if agent["name"] == name:
+            label = f"{label_prefix(state)}.{name}"
+            if need_plist:
+                sys.exit(f"toolkit agents: {label} is not installed — "
+                         f"run 'toolkit agents install {name}'")
+            return label, None
+    known = sorted(set(list(plists) + [a["name"] for a in manifest()]))
+    sys.exit(f"toolkit agents: unknown agent '{name}'. Known: {', '.join(known)}")
+
+
+def expire_pauses(state, quiet=False):
+    """--until can't be honoured by launchd, so it is checked opportunistically."""
+    paused = state.get("paused", {})
+    now = datetime.now()
+    for label, rec in list(paused.items()):
+        until = rec.get("until")
+        if not until:
             continue
-        code, _, _ = sh(["launchctl", "list", label])
-        if code == 0:
-            rows.append((OK, label, "loaded"))
+        try:
+            if datetime.fromisoformat(until) > now:
+                continue
+        except ValueError:
+            continue
+        plists = repo_plists()
+        if label in plists:
+            do_resume(label, plists[label], state, note="pause expired")
         else:
-            rows.append((WARN, label, f"not loaded — launchctl bootstrap gui/$(id -u) {plist}"))
-    return rows, bad
+            paused.pop(label, None)
+        if not quiet:
+            print(f"{label}: pause expired — resumed")
+    save_state(state)
+
+
+def do_resume(label, plist, state, note=None):
+    sh(["launchctl", "enable", f"{domain()}/{label}"])
+    code, _, err = sh(["launchctl", "bootstrap", domain(), str(plist)])
+    state.get("paused", {}).pop(label, None)
+    save_state(state)
+    if code != 0 and "already" not in err.lower():
+        return code, err
+    return 0, note or ""
+
+
+def cmd_agents(args):
+    state = load_state()
+    verb = args[0] if args else "list"
+    rest = args[1:]
+
+    if verb in ("help", "-h", "--help"):
+        print(AGENTS_HELP)
+        return 0
+
+    if verb in ("list", "status"):
+        expire_pauses(state)
+        plists = repo_plists()
+        if not plists:
+            print("no launchd agents reference this repo — "
+                  "'toolkit agents install' renders them from the manifest")
+            return 0
+        disabled = disabled_labels()
+        paused = state.get("paused", {})
+        rows = []
+        for label, plist in sorted(plists.items()):
+            loaded, runs, last_exit, running = agent_runtime(label)
+            try:
+                data = plistlib.loads(plist.read_bytes())
+            except (OSError, ValueError):
+                data = {}
+            if label in paused:
+                rec = paused[label]
+                st = f"PAUSED {rec.get('since', '')[:10]}"
+            elif running:
+                st = "running"
+            elif loaded:
+                st = "armed"
+            else:
+                st = "not loaded"
+            if label in disabled and label not in paused:
+                st += " +disabled"
+            log = data.get("StandardOutPath")
+            log_age = "-"
+            if log and Path(log).exists():
+                log_age = f"{(time.time() - Path(log).stat().st_mtime) / 3600:.0f}h ago"
+            n = int(runs) if (runs or "").isdigit() else 0
+            exited = last_exit if (last_exit or "").lstrip("-").isdigit() else None
+            rows.append((label, st, describe_schedule(data),
+                         f"{n} run" + ("" if n == 1 else "s"),
+                         f"exit {exited}" if exited is not None else "-",
+                         log_age))
+        widths = [max(len(r[i]) for r in rows) for i in range(6)]
+        print("  ".join(h.ljust(w) for h, w in
+                        zip(["LABEL", "STATE", "SCHEDULE", "RUNS", "LAST", "LOG"], widths)))
+        for r in rows:
+            print("  ".join(c.ljust(w) for c, w in zip(r, widths)))
+        for label, rec in paused.items():
+            why = rec.get("reason") or "no reason recorded"
+            until = f", until {rec['until'][:16]}" if rec.get("until") else ""
+            print(f"\n{label} is paused ({why}{until}) — "
+                  f"'toolkit agents resume {label.rsplit('.', 1)[-1]}'")
+        drift = [l for l, p in plists.items() if plist_drift(l, p)]
+        if drift:
+            print(f"\ndrift: {', '.join(drift)} differ from the manifest — "
+                  f"'toolkit agents install' re-renders")
+        return 0
+
+    if verb == "install":
+        dry = "--dry-run" in rest
+        rest = [a for a in rest if a != "--dry-run"]
+        wanted = rest[0] if rest else None
+        prefix = label_prefix(state)
+        state["label_prefix"] = prefix
+        save_state(state)
+        rc = 0
+        for agent in manifest():
+            if wanted and agent["name"] != wanted:
+                continue
+            label = f"{prefix}.{agent['name']}"
+            plist = LAUNCH_AGENTS / f"{label}.plist"
+            data = render_plist(agent, label)
+            missing = [p for p in agent["program"][:1] + agent["program"][1:2]
+                       if p.startswith("/") and not Path(p).exists()]
+            if missing:
+                print(f"{agent['name']}: SKIPPED — program not found: {missing[0]}")
+                rc = 1
+                continue
+            if dry:
+                print(f"--- {plist} ---")
+                print(plistlib.dumps(data).decode().rstrip())
+                continue
+            LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
+            for logpath in {data.get("StandardOutPath")} - {None}:
+                Path(logpath).parent.mkdir(parents=True, exist_ok=True)
+            plist.write_bytes(plistlib.dumps(data))
+            sh(["launchctl", "bootout", f"{domain()}/{label}"])
+            sh(["launchctl", "enable", f"{domain()}/{label}"])
+            code, _, err = sh(["launchctl", "bootstrap", domain(), str(plist)])
+            if code != 0:
+                print(f"{agent['name']}: rendered, but bootstrap failed: {err[:80]}")
+                rc = 1
+            else:
+                warn = " (RunAtLoad fired a run now)" if data["RunAtLoad"] else ""
+                print(f"{agent['name']}: installed -> {label}{warn}")
+        return rc
+
+    if not rest:
+        sys.exit(f"toolkit agents {verb}: needs an agent name")
+    name = rest[0]
+    opts = rest[1:]
+
+    if verb == "run":
+        label, plist = resolve(name, state)
+        code, _, err = sh(["launchctl", "kickstart", "-k", f"{domain()}/{label}"])
+        if code != 0:
+            sys.exit(f"toolkit agents run: {err[:120]}")
+        print(f"{label}: started")
+        return 0
+
+    if verb == "stop":
+        label, plist = resolve(name, state)
+        code, _, err = sh(["launchctl", "kill", "TERM", f"{domain()}/{label}"])
+        # Killing a job that isn't running is not an error worth failing on.
+        print(f"{label}: TERM sent" if code == 0 else f"{label}: not running")
+        return 0
+
+    if verb == "pause":
+        label, plist = resolve(name, state)
+        reason = opt_value(opts, "--reason") or ""
+        until = None
+        if opt_value(opts, "--until"):
+            hh, mm = opt_value(opts, "--until").split(":", 1)
+            t = datetime.now().replace(hour=int(hh), minute=int(mm),
+                                       second=0, microsecond=0)
+            if t <= datetime.now():
+                t += timedelta(days=1)
+            until = t.isoformat()
+        elif opt_value(opts, "--for"):
+            sched = parse_schedule_spec([opt_value(opts, "--for")])
+            until = (datetime.now()
+                     + timedelta(seconds=sched["seconds"])).isoformat()
+        sh(["launchctl", "bootout", f"{domain()}/{label}"])
+        sh(["launchctl", "disable", f"{domain()}/{label}"])
+        state.setdefault("paused", {})[label] = {
+            "since": datetime.now().isoformat(timespec="seconds"),
+            "reason": reason, "until": until}
+        save_state(state)
+        tail = f", until {until[:16]}" if until else ""
+        print(f"{label}: paused (booted out + disabled){tail}")
+        return 0
+
+    if verb == "resume":
+        label, plist = resolve(name, state)
+        data = plistlib.loads(plist.read_bytes())
+        code, err = do_resume(label, plist, state)
+        if code != 0:
+            sys.exit(f"toolkit agents resume: {err[:120]}")
+        note = " — RunAtLoad fired a run now" if data.get("RunAtLoad") else ""
+        print(f"{label}: resumed (enabled + bootstrapped){note}")
+        return 0
+
+    if verb == "logs":
+        label, plist = resolve(name, state)
+        data = plistlib.loads(plist.read_bytes())
+        log = data.get("StandardOutPath")
+        if not log or not Path(log).exists():
+            sys.exit(f"toolkit agents logs: no log file for {label}")
+        n = opt_value(opts, "-n") or "40"
+        if "-f" in opts:
+            os.execvp("tail", ["tail", "-f", "-n", n, log])
+        print(f"# {log}")
+        lines = Path(log).read_text(errors="ignore").splitlines()
+        print("\n".join(lines[-int(n):]))
+        return 0
+
+    if verb == "every":
+        label, plist = resolve(name, state)
+        sched = parse_schedule_spec(opts)
+        data = plistlib.loads(plist.read_bytes())
+        for key in ("StartCalendarInterval", "StartInterval"):
+            data.pop(key, None)
+        data.update(schedule_keys(sched))
+        plist.write_bytes(plistlib.dumps(data))
+        sh(["launchctl", "bootout", f"{domain()}/{label}"])
+        code, _, err = sh(["launchctl", "bootstrap", domain(), str(plist)])
+        if code != 0:
+            sys.exit(f"toolkit agents every: reloaded plist but bootstrap failed: {err[:80]}")
+        print(f"{label}: now {describe_schedule(data)}")
+        print("note: this edits the installed plist. Update "
+              f"{AGENT_MANIFEST.relative_to(REPO)} too, or the next "
+              "'agents install' reverts it.")
+        return 0
+
+    sys.exit(f"toolkit agents: unknown verb '{verb}' — see 'toolkit agents help'")
+
+
+def opt_value(opts, flag):
+    if flag in opts:
+        i = opts.index(flag)
+        if i + 1 < len(opts):
+            return opts[i + 1]
+        sys.exit(f"toolkit agents: {flag} needs a value")
+    return None
+
+
+def plist_drift(label, plist):
+    """True when the installed plist differs from what the manifest renders."""
+    name = label.rsplit(".", 1)[-1]
+    for agent in manifest():
+        if agent["name"] != name:
+            continue
+        try:
+            live = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError):
+            return True
+        return live != render_plist(agent, label)
+    return False
+
+
+AGENTS_HELP = """toolkit agents — control this repo's launchd jobs.
+
+  toolkit agents list|status            state, schedule, runs, last exit, log age
+  toolkit agents install [name] [--dry-run]
+                                        render from automation/launchd/agents.json
+                                        and (re)bootstrap
+  toolkit agents run <name>             fire one tick now (kickstart -k)
+  toolkit agents stop <name>            kill the RUNNING tick; schedule stays armed
+  toolkit agents pause <name> [--reason "..."] [--until HH:MM | --for 4h]
+                                        bootout AND disable, and record why
+  toolkit agents resume <name>          enable AND bootstrap
+  toolkit agents logs <name> [-n N] [-f]
+  toolkit agents every <name> <spec>    'daily 09:00' | 'hourly 9-18' | '30m'
+
+<name> is the short name (worklog) or the full label.
+
+Why the command exists: `bootout` alone does not survive login and `disable`
+alone does not stop a loaded job, so a real pause is both — and an unrecorded
+pause is indistinguishable from a broken install in 'toolkit doctor'."""
 
 
 def check_directives(bin_dir):
@@ -232,6 +695,8 @@ def main():
         cmd_install(bin_dir)
     elif cmd == "list":
         cmd_list()
+    elif cmd == "agents":
+        return cmd_agents(args[1:])
     elif cmd == "doctor":
         return cmd_doctor(bin_dir)
     else:

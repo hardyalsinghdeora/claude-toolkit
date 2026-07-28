@@ -11,7 +11,7 @@ macOS-native way to run toolkit jobs **whenever the laptop is on**, independent 
 
 Both are local-only and cost no tokens — an mtime-incremental index sweep and a work-log rollup. Agents that run a headless `claude -p` session per tick are possible but **bill on every tick**; treat that as a deliberate choice, bound the schedule tightly, and read the watchdog note under Gotchas first.
 
-The plists live in `~/Library/LaunchAgents/` and are **not tracked in this repo** — see G4/G5 in `ENHANCEMENTS.md` for the planned `toolkit agents` wrapper and versioned templates.
+The plists live in `~/Library/LaunchAgents/`, rendered from `automation/launchd/agents.json` by `toolkit agents install` — that manifest, not the plist, is the source of truth.
 
 ## How it works
 
@@ -55,9 +55,23 @@ The plists live in `~/Library/LaunchAgents/` and are **not tracked in this repo*
 </plist>
 ```
 
-launchd does not expand `~` or `$HOME` in a plist — absolute paths only, which is exactly why G5 wants these rendered from templates rather than hand-edited.
+launchd does not expand `~` or `$HOME` in a plist — absolute paths only, which is exactly why these are rendered from a manifest rather than hand-edited.
 
 ## Install / manage
+
+**Prefer `toolkit agents`** — it wraps everything below, and gets right the two things that are easy to get half-right (a pause is `bootout` *and* `disable`; a resume is `enable` *before* `bootstrap`). It also records *why* an agent was paused, so `toolkit doctor` stops reporting a deliberate pause as a fault:
+
+```sh
+toolkit agents list                       # state, schedule, runs, last exit, log age
+toolkit agents run worklog                # fire one tick now
+toolkit agents stop worklog               # kill the running tick, keep the schedule
+toolkit agents pause worklog --reason "…" --until 18:00
+toolkit agents resume worklog
+toolkit agents every worklog 'hourly 9-18'
+toolkit agents install [--dry-run]        # render plists from automation/launchd/agents.json
+```
+
+See `toolkit.md`. The rest of this section is the underlying `launchctl` reference — what the wrapper runs, and what to use for an agent the toolkit does not manage.
 
 `load`/`unload`/`start` are the legacy spellings; on current macOS use the domain-target form. `L` = the label, `P` = its plist path:
 
@@ -118,7 +132,7 @@ launchctl bootout $D/$L; rm "$P"
 ## Gotchas that have actually bitten
 
 - **`bootstrap` fires an immediate run** whenever `RunAtLoad` is true — costly if the job is a headless model session. Set it false while you are only editing the schedule.
-- **A paused job looks identical to a broken one.** `toolkit doctor` reports `not loaded — launchctl bootstrap ...` whether you paused it deliberately or the install rotted after a repo move (S10). Until G4 lands, leave a note when you pause something.
+- **A paused job looks identical to a broken one** at the `launchctl` level — which is why `toolkit agents pause` records the reason and `doctor` reads it back. Pause with the raw commands and you lose that.
 - **launchd has no per-job timeout.** A hung tick runs forever — a headless refresh job once idled 91 minutes before being killed by hand. Any job that calls out to the network or a model needs its own `timeout` in the wrapper script, plus a lockfile so a slow tick cannot overlap the next one.
 - **launchd does not load your shell profile** — set `PATH` in `EnvironmentVariables` or in the script itself. Tools installed by `toolkit install` live in `~/.local/bin`.
 - **Interactively-authenticated MCP connectors are unavailable headless.** Only HTTP/stdio MCP servers configured at user level are reachable from a `claude -p` run; anything that needed a browser login in an interactive session will not be there.

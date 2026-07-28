@@ -17,6 +17,8 @@ Plus `Scripts/atlassian/atl` — an offline Jira/Confluence fetcher (JQL search,
 
 How these fit together — and the manual habits they can't replace — is in [docs/token-optimization.md](docs/token-optimization.md).
 
+**Per-module documentation** — design rationale, storage layout and gotchas for each tool — is in [docs/](docs/README.md). The build history and the failures that motivated each piece are in [docs/project-history.md](docs/project-history.md).
+
 ## claude-toggle — MCP servers on/off
 
 Enable/disable local MCP servers for Claude Code without losing their configuration, and save/restore whole config profiles.

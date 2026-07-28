@@ -10,6 +10,7 @@ Skill/*
 !Skill/_example/
 !Skill/worklog/
 automation/pr-*
+automation/.cache/
 
 # --- usage data & logs
 *.log

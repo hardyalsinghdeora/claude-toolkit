@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Source of truth for this repo's launchd agents. `toolkit agents install`",
+    "renders each entry to ~/Library/LaunchAgents/<prefix>.<name>.plist.",
+    "launchd does not expand ~ or $HOME inside a plist, so absolute paths are",
+    "substituted here at render time: {{REPO}} and {{HOME}}.",
+    "",
+    "schedule types:",
+    "  {\"type\": \"daily\",    \"hour\": 9, \"minute\": 0}",
+    "  {\"type\": \"hourly\",   \"from\": 9, \"to\": 18, \"minute\": 0}",
+    "  {\"type\": \"interval\", \"seconds\": 1800}"
+  ],
+  "agents": [
+    {
+      "name": "cindex-refresh",
+      "description": "rebuild cindex indexes for every code folder in ~/Workspace",
+      "program": ["/bin/zsh", "{{REPO}}/automation/cindex-refresh.sh"],
+      "schedule": {"type": "daily", "hour": 9, "minute": 0},
+      "run_at_load": true,
+      "log": "{{HOME}}/.claude/code-index/logs/launchd.log"
+    },
+    {
+      "name": "worklog",
+      "description": "write the daily work log from the session index and git commits",
+      "program": ["{{REPO}}/Scripts/worklog/worklog", "check"],
+      "schedule": {"type": "daily", "hour": 21, "minute": 15},
+      "run_at_load": true,
+      "log": "{{HOME}}/.claude/code-index/logs/worklog-launchd.log",
+      "env": {"PATH": "{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin"}
+    }
+  ]
+}

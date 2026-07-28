@@ -30,14 +30,14 @@ These all happened in practice and each maps to a feature below:
 
 ## claude-vault
 
-### V1. First-class non-interactive `set` — **P0, small**
+### V1. ~~First-class non-interactive `set`~~ — **done 2026-07-17** (vault 1.1.0; `--stdin`, `--from-clipboard`, hidden prompt)
 Today stdin piping works by accident of `sys.stdin.isatty()`. Make it official:
 `claude-vault set <name> --stdin`, plus `--from-clipboard` (reads `pbpaste`, offers to clear the clipboard after). Document both in help. Never accept the value as an argv argument (would leak into shell history / `ps`).
 
-### V2. `rename` command — **P0, small**
+### V2. ~~`rename` command~~ — **done 2026-07-17** (vault 1.1.0)
 `claude-vault rename <old> <new>`: copy Keychain item, update index, delete old — atomic from the user's view. (S3 did this by hand.)
 
-### V3. Update a single JSON field — **P0, small**
+### V3. ~~Update a single JSON field~~ — **done 2026-07-17** (vault 1.1.0; `set --field`, `get --field`)
 `claude-vault set <name> --field password` prompts for just that field, merges into the existing JSON. Avoids the rebuild-whole-blob dance of S4 and avoids re-pasting fields that were already correct.
 
 ### V4. ~~`doctor` — reconcile Keychain vs index~~ — **done 2026-07-27** (vault 1.3.0; report by default, `--fix` adopts/prunes)
@@ -76,10 +76,10 @@ Abstract `kc_set/kc_get/kc_delete` behind a backend interface: macOS `security` 
 
 ## claude-toggle
 
-### T1. Backup retention — **P0, small**
+### T1. ~~Backup retention~~ — **done 2026-07-17** (toggle 1.2.0; `backups prune [--keep N]`, default keep 20)
 `~/.claude/backups/` grows without bound (one file per mutation, forever). Add `claude-toggle backups prune [--keep 20]` and auto-prune to the newest N after each backup.
 
-### T2. Profile load is destructive to settings.json — **P0, small**
+### T2. ~~Profile load is destructive to settings.json~~ — **done 2026-07-17** (toggle 1.2.0; `profile load --all|--settings-only`, MCP-only by default)
 `profile load` **replaces** `settings.json` wholesale with whatever was snapshotted, silently dropping anything added since the snapshot (permissions, hooks…). Fix: back up `settings.json` too (today only `.claude.json` is backed up), and add `--mcp-only` / `--settings-only` flags; make `--mcp-only` the default and full overwrite opt-in.
 
 ### T3. ~~`status` / `diff`~~ — **done 2026-07-27** (toggle 1.5.0; status includes matching-profile detection and directive states)
@@ -120,10 +120,10 @@ Directives currently only target the global `~/.claude/CLAUDE.md`. A `--project 
 ### C1. ~~Fix stale vault references~~ — **done 2026-07-17**
 Now reads `prod-core-db`; the `prod-core-pass` fallback is removed.
 
-### C2. Fail fast with a VPN hint — **P0, small**
+### C2. ~~Fail fast with a VPN hint~~ — **done 2026-07-17** (db-conn; `nc -z -G 3` probe before psql, names the VPN)
 Before running psql, probe the host (`nc -z -G 3 $HOST $PORT`). On failure print: `cannot reach $HOST:$PORT — if this is the prod/stg RDS (private IP), connect to the VPN first.` Turns S7's silent multi-minute hang into an instant, actionable error.
 
-### C3. Multi-environment support — **P0, small**
+### C3. ~~Multi-environment support~~ — **done 2026-07-17** (db-conn `--env prod|stg|test|local`)
 `core-db --env prod|stg|test|local ...` (default `prod`) selecting the `<env>-core-db` vault entry. All four entries already exist with identical shape, so this is just string substitution.
 
 ### C4. ~~Prod write guard~~ — **done 2026-07-27** (db-conn; entries matching *prod* block INSERT/UPDATE/DELETE/DDL unless `--write`)
@@ -220,6 +220,42 @@ Skills now exist in TWO places: `Promt/Skills/*.md` (older, MCP-first) and `Clau
 
 ---
 
+## toolkit-gui — a macOS front end (new 2026-07-28)
+
+**macOS only for now.** The tools are Keychain-, `launchctl`- and `pbpaste`-bound already (V11 exists precisely because a cross-platform vault backend does not), so a Mac-only shell adds no portability debt that is not already there. Revisit only if V11 ever ships.
+
+The suite is nine CLIs plus three index stores, and its outputs are markdown files under `Output/`. Everything needed to *read* that state — `list`, `status`, `doctor`, `directives`, `dbindex list` — is already a command whose output is a table. A GUI earns its place by making that state visible at a glance and by making the read-only paths clickable; it does **not** earn its place by reimplementing any of it.
+
+### U1. Shell out, never reimplement — **P0, foundational**
+Every panel is a rendering of a real command's output, and the command is shown. The GUI parses `--json` where a tool offers it (`claude-vault list --json`, `cindex --json`, `dbindex --json`, `csession --json`) and falls back to text elsewhere. Consequences worth stating up front, because they are the whole design:
+- the CLI stays the source of truth, so a GUI bug can never disagree with `toolkit doctor`;
+- anything the GUI cannot do, the user can do in the terminal it just showed them;
+- G2 (shared helpers) becomes more valuable — a uniform `--json` shape across the index family is what keeps this from being nine bespoke parsers. **Do G2 first.**
+
+### U2. Tools list + directory listing — **P1, medium**
+The primary navigation: one row per tool (the nine `toolkit list` entries) with version, symlink health and last-run, mirroring `toolkit doctor`'s per-tool row. Selecting a tool opens its panel.
+
+The **directory listing** hangs off the same sidebar: the indexed projects under `~/Workspace` that `cindex` already knows about, with per-repo index age and branch, drilling into the file tree. Read-only browsing — clicking a file opens it in the markdown/code view (U3), it does not edit. The listing comes from the cindex index rather than a live filesystem walk, so it is instant and it respects `.claudeignore` for free.
+
+### U3. Markdown view — **P1, small**
+`Output/` is the suite's deliverable surface: worklogs, reports, review files. Render the selected `.md` with GitHub-ish styling, a file tree of `Output/` on one side, and raw/rendered toggle. Read-only in v1; editing is a separate decision, not a freebie.
+
+### U4. Terminal view — **P1, medium**
+An embedded terminal pane, for two distinct jobs that should not be confused:
+1. **Echo** — every command the GUI runs appears here with its exit code, so the GUI is auditable and teaches its own CLI.
+2. **Drop to a real shell** — a live PTY in the repo/project directory, because the moment a user needs `claude-vault set` or an interactive `psql`, the GUI must get out of the way rather than build a worse version of it.
+
+The PTY is the one genuinely non-trivial piece (`forkpty`, resize, ANSI). If it threatens the schedule, ship U4.1 (echo-only, a log view) and defer the live shell — the rest of the GUI does not depend on it.
+
+### U5. Secrets stay out of the GUI — **P0, non-negotiable**
+`claude-vault list` metadata (name, type, rotation age, description) renders; **values never do**. No "reveal" button, no clipboard button that pulls a value through the GUI process. Password-type entries are deliberately terminal-only today, and a GUI that quietly relaxes that has undone the reason the vault exists. Actions that need a value (`set`, `test`, `exec`) hand off to the terminal pane. Same rule for `db-conn`: query *results* may render, connection details may not.
+
+### U6. Build shape — **P2, decision needed**
+Not settled. SwiftUI is the honest default for a Mac-only, filesystem-and-subprocess app: native file tree, no runtime to ship, real PTY access via `Process`/`forkpty`. The cost is that the toolkit becomes bilingual — nine Python/zsh tools plus a Swift app — and the GUI cannot be maintained from the same session that maintains the tools without a context switch. The alternative, a local web UI (Python server + browser), keeps one language and gets markdown rendering nearly free, but a browser tab is a worse home for a terminal and for a persistent window. **Decide before U2; it is not reversible cheaply.**
+
+### U7. Non-goals for v1 — **P0, scoping**
+No editing of code or config from the GUI. No vault writes. No MCP server toggling that the GUI cannot show the diff for (`claude-toggle` mutates `.claude.json`; doing that behind a button with no preview is how S8-style silent breakage happens). No bundling/notarization/distribution — this is a personal tool until it is not.
+
 ## Cross-cutting
 
 ### G1. ~~`toolkit doctor` / install script~~ — **done 2026-07-27** (new `toolkit` CLI: install relinks all 9 tools; doctor checks links/versions/PATH/launchd/directives/index age/vault and exits non-zero. First run caught two real faults: `atl` was never on PATH and `db-conn` had no --version)
@@ -231,7 +267,7 @@ S10 (all symlinks dead for days) needs a guard: an `install.sh` that (re)links e
 ### G3. ~~Commit the suite~~ — **done 2026-07-27** (pushed to github.com/hardyalsinghdeora/claude-toolkit)
 The four new tools, automation/, and the doc updates are uncommitted (`git status` shows them untracked). Commit as the "token-optimization suite" milestone.
 
-### G4. `toolkit agents` — one control surface for the launchd jobs — **P1, medium**
+### G4. ~~`toolkit agents` — one control surface for the launchd jobs~~ — **done 2026-07-28** (toolkit 1.1.0; `list/status`, `install`, `run`, `stop`, `pause`, `resume`, `logs`, `every`. Pause state in `~/.claude/toolkit-agents.json`; `doctor` now reports a recorded pause as ok-with-reason instead of a false fault)
 
 Today `toolkit doctor` only *reports* whether an agent is loaded; every actual operation is a hand-typed `launchctl` incantation, and the modern (`bootstrap`/`bootout`/`kickstart`) and legacy (`load`/`unload`/`start`) spellings are mixed across `docs/launch-agent.md` and muscle memory. Two jobs run off this repo — `cindex-refresh` (daily 09:00) and `worklog` (daily 21:15), both local-only and token-free.
 
@@ -255,7 +291,7 @@ Design notes worth encoding, because each is a mistake already made or narrowly 
 - **`RunAtLoad` + `bootstrap` = an unintended immediate run.** `resume` should either strip `RunAtLoad` for the reload or say plainly that a tick is about to fire.
 - **`--until`** can't rely on launchd alone; the cheapest honest implementation is for `resume` to be checked opportunistically (on the next `toolkit doctor` / `agents list`), not to promise a wake-up.
 
-### G5. Versioned plist templates + `toolkit agents install` — **P1, small**
+### G5. ~~Versioned plist templates + `toolkit agents install`~~ — **done 2026-07-28** (`automation/launchd/agents.json` is the source of truth; plists are rendered with `plistlib` from `{{REPO}}`/`{{HOME}}` substitutions, and drift from the manifest is reported by both `agents list` and `doctor`)
 
 The plists are untracked one-offs in `~/Library/LaunchAgents/` (S16), and launchd does not expand `~` or `$HOME` inside a plist, so every one of them hardcodes an absolute path that a repo move invalidates. Add `automation/launchd/*.plist.tmpl` with `{{REPO}}`/`{{HOME}}`/`{{SCHEDULE}}` placeholders, and `toolkit agents install [<label>] [--dry-run]` that renders and bootstraps them — the same idempotent contract `toolkit install` already has for the 9 symlinks. Then a repo move is one command (`toolkit install && toolkit agents install`) instead of hand-edited XML, and `doctor` can diff live plist vs template and flag drift. Pairs with G1.
 
@@ -278,8 +314,15 @@ After this, credentials are verifiable, importable without chat-pasting, and inj
 **Phase 4 — token-optimization suite hardening: ✅ core done 2026-07-27** — G1, G3, A1, A2, A3, T9, T10, X1, X2, D1, N1, N3, Q1 (new `toolkit` CLI; claude-toggle 1.7.0, cindex 1.4.0, dbindex 1.1.0, csession 1.1.0, squeeze 1.1.0, atl 1.1.0, db-conn 1.2.0).
 Still open, deliberately (no friction yet): G2 shared helpers, A4 Bitbucket `bbt` + K2, A5 backoff, K1 skill dedup, Q2 profiles, X3/X4, D2/D3/D4, N2/N4, T11.
 
-**Phase 5 — scheduled-agent control (opened 2026-07-28, not started):** G4 `toolkit agents`, then G5 versioned plists.
-Trigger: S15/S16 — a job stopped by a raw `bootout` sits in a state `doctor` reports as a fault, and the plists have no source of truth. G4 first (it makes agent state legible and reversible), G5 second (removes the untracked-plist liability). G6 was dropped with the pr-dashboard removal.
+**Phase 5 — scheduled-agent control: ✅ done 2026-07-28** — G4, G5 (toolkit 1.1.0). G6 was dropped with the pr-dashboard removal.
+S15 and S16 are both closed: a pause now records *why* and reads as `ok` in `doctor`, and the plists are rendered from a tracked manifest rather than hand-edited in `~/Library/LaunchAgents/`.
+
+Two deviations from the plan as written, both deliberate:
+- **Manifest, not `.plist.tmpl` templates.** `automation/launchd/agents.json` holds structured agent definitions and `plistlib` renders the XML. String templates cannot support `agents every` — retiming needs structured schedule data, not text substitution — and `plistlib` output is valid by construction.
+- **`--until` is opportunistic, as designed.** launchd cannot wake a job to un-pause it, so expiry is checked whenever `agents list` or `doctor` runs. A pause that expires while nothing looks at it stays paused until something does; the alternative would be a watchdog agent to supervise the agents.
+
+**Phase 6 — `toolkit-gui`, a macOS front end (opened 2026-07-28, not started):** U1–U7.
+Order: **U6 first** (SwiftUI vs local web UI — the one irreversible call), then U1 shell-out contract, U2 tools + directory listing, U3 markdown view, U4 terminal view. U5 and U7 are constraints that apply throughout, not steps. **G2 is a prerequisite** — a uniform `--json` shape across the index family is what keeps U1 from becoming nine bespoke output parsers, so G2 graduates from "P2, when friction appears" to blocking work.
 
 **Hygiene — public-repo scrub (2026-07-28):** the pr-dashboard automation was deleted from the repo and the hardcoded tenant/email/username removed (S17). The **git history still contains them** in commits `1af84b3`..`5a8eb78`, already pushed to `origin` and possibly to the `private-old` remote — a history rewrite + force-push is the outstanding half, and needs an explicit decision because it invalidates every existing clone.
 
@@ -292,5 +335,6 @@ Original order of work:
 ## Non-goals (for now)
 
 - Syncing secrets between machines or to any cloud — the whole point is local-only Keychain storage.
-- A GUI — these are AI-session-first CLI tools.
+- ~~A GUI~~ — reversed 2026-07-28: a **read-only macOS front end** is now Phase 6 (`toolkit-gui`, U1–U7). The non-goal it replaces still holds in spirit: the CLIs stay the source of truth and the GUI shells out to them, so this is a viewer over an AI-session-first toolkit, not a second way to drive it.
 - Replacing 1Password/real secret managers — this is a personal automation bridge, not a team product.
+- Cross-platform anything (see V11). The GUI is macOS-only by the same logic.
