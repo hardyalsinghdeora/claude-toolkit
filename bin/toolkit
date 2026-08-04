@@ -26,24 +26,27 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 VERSION = "1.1.0"
-REPO = Path(__file__).resolve().parent
+# this script lives in bin/, so the repo root is one level up
+REPO = Path(__file__).resolve().parent.parent
 DEFAULT_BIN = Path.home() / ".local" / "bin"
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 AGENT_MANIFEST = REPO / "automation" / "launchd" / "agents.json"
+AGENT_MANIFEST_LOCAL = REPO / "automation" / "launchd" / "agents.local.json"
 AGENT_STATE = Path.home() / ".claude" / "toolkit-agents.json"
 DEFAULT_PREFIX = "com.claude-toolkit"
 
 # name -> path within the repo
 TOOLS = {
-    "claude-toggle": "claude-toggle",
-    "claude-vault": "claude-vault",
-    "db-conn": "db-conn",
-    "squeeze": "squeeze",
-    "cindex": "cindex",
-    "dbindex": "dbindex",
-    "csession": "csession",
-    "atl": "Scripts/atlassian/atl",
-    "worklog": "Scripts/worklog/worklog",
+    "claude-toggle": "bin/claude-toggle",
+    "claude-vault": "bin/claude-vault",
+    "db-conn": "bin/db-conn",
+    "squeeze": "bin/squeeze",
+    "cindex": "bin/cindex",
+    "dbindex": "bin/dbindex",
+    "csession": "bin/csession",
+    "atl": "bin/atl",
+    "worklog": "bin/worklog",
+    "claude-audit": "bin/claude-audit",
 }
 
 INDEXES = {
@@ -205,10 +208,23 @@ def label_prefix(state):
 
 
 def manifest():
-    try:
-        data = json.loads(AGENT_MANIFEST.read_text())
-    except (OSError, ValueError) as e:
-        sys.exit(f"toolkit agents: cannot read {AGENT_MANIFEST}: {e}")
+    """Tracked agents, then local-only ones layered on top.
+
+    agents.local.json is gitignored — it is where workplace-specific jobs live
+    so they can never be staged into the public repo. Same name in both files
+    means the local entry wins.
+    """
+    entries = []
+    for path in (AGENT_MANIFEST, AGENT_MANIFEST_LOCAL):
+        if path is AGENT_MANIFEST_LOCAL and not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            sys.exit(f"toolkit agents: cannot read {path}: {e}")
+        for a in data.get("agents", []):
+            entries = [e for e in entries if e.get("name") != a.get("name")]
+            entries.append(a)
     subs = {"{{REPO}}": str(REPO), "{{HOME}}": str(Path.home())}
 
     def expand(v):
@@ -222,7 +238,7 @@ def manifest():
             return {k: expand(x) for k, x in v.items()}
         return v
 
-    return [expand(a) for a in data.get("agents", [])]
+    return [expand(a) for a in entries]
 
 
 def schedule_keys(sched):
@@ -236,6 +252,17 @@ def schedule_keys(sched):
         return {"StartCalendarInterval": [{"Hour": h, "Minute": minute}
                                           for h in range(int(sched["from"]),
                                                          int(sched["to"]) + 1)]}
+    if t == "window":
+        step = int(sched.get("every_minutes", 30))
+        if step < 1 or step > 60 or 60 % step:
+            sys.exit("toolkit agents: 'window' every_minutes must divide 60")
+        lo, hi = int(sched["from"]), int(sched["to"])
+        # 'to' closes the window rather than adding an hour of ticks:
+        # 9-18 every 30m is 09:00 … 18:00, not 18:30.
+        return {"StartCalendarInterval":
+                [{"Hour": h, "Minute": m}
+                 for h in range(lo, hi + 1) for m in range(0, 60, step)
+                 if not (h == hi and m > 0)]}
     if t == "interval":
         return {"StartInterval": int(sched["seconds"])}
     sys.exit(f"toolkit agents: unknown schedule type {t!r} in the manifest")
@@ -246,11 +273,13 @@ def describe_schedule(plist_data):
     if isinstance(cal, dict):
         return f"daily {cal.get('Hour', 0):02d}:{cal.get('Minute', 0):02d}"
     if isinstance(cal, list) and cal:
-        hours = sorted(c.get("Hour", 0) for c in cal)
-        minute = cal[0].get("Minute", 0)
+        hours = sorted({c.get("Hour", 0) for c in cal})
+        minutes = sorted({c.get("Minute", 0) for c in cal})
         contiguous = hours == list(range(hours[0], hours[-1] + 1))
         span = f"{hours[0]}-{hours[-1]}" if contiguous else ",".join(map(str, hours))
-        return f"hourly {span} at :{minute:02d}"
+        if len(minutes) == 1:
+            return f"hourly {span} at :{minutes[0]:02d}"
+        return f"every {minutes[1] - minutes[0]}m {span}"
     if "StartInterval" in plist_data:
         secs = int(plist_data["StartInterval"])
         return f"every {secs // 60}m" if secs % 3600 else f"every {secs // 3600}h"
@@ -258,14 +287,14 @@ def describe_schedule(plist_data):
 
 
 def parse_schedule_spec(words):
-    """'daily 09:00' | 'hourly 9-18' | '30m' -> a manifest schedule dict.
+    """'daily 09:00' | 'hourly 9-18' | '30m 9-18' | '30m' -> a schedule dict.
 
     Accepts the spec as separate argv words or as one quoted string.
     """
     words = " ".join(words).split()
     if not words:
         sys.exit("toolkit agents every: give a schedule, e.g. 'daily 09:00', "
-                 "'hourly 9-18', '30m'")
+                 "'hourly 9-18', '30m 9-18', '30m'")
     head = words[0].lower()
     if head == "daily" and len(words) > 1 and ":" in words[1]:
         h, m = words[1].split(":", 1)
@@ -273,6 +302,12 @@ def parse_schedule_spec(words):
     if head == "hourly" and len(words) > 1 and "-" in words[1]:
         a, b = words[1].split("-", 1)
         return {"type": "hourly", "from": int(a), "to": int(b), "minute": 0}
+    # '30m 9-18' is a bounded window; bare '30m' is round-the-clock.
+    m = re.fullmatch(r"(\d+)m", head)
+    if m and len(words) > 1 and "-" in words[1]:
+        a, b = words[1].split("-", 1)
+        return {"type": "window", "from": int(a), "to": int(b),
+                "every_minutes": int(m.group(1))}
     m = re.fullmatch(r"(\d+)([smh])", head)
     if m:
         mult = {"s": 1, "m": 60, "h": 3600}[m.group(2)]
@@ -584,14 +619,15 @@ AGENTS_HELP = """toolkit agents — control this repo's launchd jobs.
   toolkit agents list|status            state, schedule, runs, last exit, log age
   toolkit agents install [name] [--dry-run]
                                         render from automation/launchd/agents.json
-                                        and (re)bootstrap
+                                        (+ agents.local.json) and (re)bootstrap
   toolkit agents run <name>             fire one tick now (kickstart -k)
   toolkit agents stop <name>            kill the RUNNING tick; schedule stays armed
   toolkit agents pause <name> [--reason "..."] [--until HH:MM | --for 4h]
                                         bootout AND disable, and record why
   toolkit agents resume <name>          enable AND bootstrap
   toolkit agents logs <name> [-n N] [-f]
-  toolkit agents every <name> <spec>    'daily 09:00' | 'hourly 9-18' | '30m'
+  toolkit agents every <name> <spec>    'daily 09:00' | 'hourly 9-18'
+                                        | '30m 9-18' (windowed) | '30m'
 
 <name> is the short name (worklog) or the full label.
 

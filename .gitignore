@@ -1,19 +1,32 @@
 # --- task-specific work products: personal/company data, never for the public repo
 # (folder READMEs and the example skill are kept as reference)
+# Brain/ is the AI knowledge base: company-confidential product specs and
+# ~1,300 fetched Confluence pages. This repo has a PUBLIC remote, so this rule
+# is the only thing keeping that content off GitHub. Do not relax it, and do
+# not 'git add -f' anything beneath it.
+Brain/
 Output/*
 !Output/README.md
 !Output/worklog/
 Output/worklog/*
 !Output/worklog/README.md
-Skill/*
-!Skill/README.md
-!Skill/_example/
-!Skill/worklog/
+# Renamed from Skill/ — and the rename silently voided the old rules, because
+# git matches these case-sensitively even on a case-insensitive filesystem. All
+# eleven workplace skills were staged again as a result, having been excluded
+# since the repo went public. Rename this folder and you must rename these lines
+# in the same commit; the allowlist below is the only thing keeping them local.
+skills/*
+!skills/README.md
+!skills/_example/
+!skills/worklog/
 # automation/ is allowlisted: anything dropped in here is local until it is
 # explicitly un-ignored, so workplace-specific jobs can never be staged by accident
 automation/*
 !automation/cindex-refresh.sh
 !automation/launchd/
+# ...but the local agent manifest is workplace-specific by design
+automation/launchd/agents.local.json
+ENHANCEMENTS.md
 
 # --- usage data & logs
 *.log
@@ -24,7 +37,13 @@ automation/*.log
 .env
 *.env
 
+# --- build/interpreter artefacts
+# no trailing-slash-only anchor: these must match at any depth, not just the root
+__pycache__/
+*.pyc
+
 # --- OS/editor noise
 .DS_Store
 *.tmp
 *.zip
+*.bak

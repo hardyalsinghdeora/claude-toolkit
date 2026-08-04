@@ -11,9 +11,9 @@ Small, dependency-free CLI tools that make AI coding sessions (Claude Code) safe
 - **csession** — task-level index of all Claude Code sessions: find past work, resume-vs-new-session suggestions, compact context briefs, combined work journal, safe pruning
 
 - **toolkit** — one command to install every tool (`toolkit install`) and one to verify the whole setup (`toolkit doctor`: symlinks, versions, PATH, launchd agents, directive freshness, index age, vault health; non-zero exit when broken)
-- **worklog** (`Scripts/worklog/`) — zero-token daily work logs: auto-generated at login and 21:15 from the csession index + git commits (sessions, commits, files touched, improvement flags), backfilling the last 7 days so weekends/leave need no bookkeeping; `worklog week` aggregates for reports, and the `worklog` skill layers AI narrative and coaching on top. See `Output/worklog/README.md` for the file format.
+- **worklog** (`bin/`) — zero-token daily work logs: auto-generated at login and 21:15 from the csession index + git commits (sessions, commits, files touched, improvement flags), backfilling the last 7 days so weekends/leave need no bookkeeping; `worklog week` aggregates for reports, and the `worklog` skill layers AI narrative and coaching on top. See `Output/worklog/README.md` for the file format.
 
-Plus `Scripts/atlassian/atl` — an offline Jira/Confluence fetcher (JQL search, sprint issues, fix-version resolution, page-to-plain-text, accountId lookup, issue creation) authenticated via a `jira-api-token` claude-vault entry. The `Skill/` workflows call it instead of the Atlassian MCP, turning schema-heavy MCP round-trips into compact TSV/text.
+Plus `bin/atl` — an offline Jira/Confluence fetcher (JQL search, sprint issues, fix-version resolution, page-to-plain-text, accountId lookup, issue creation) authenticated via a `jira-api-token` claude-vault entry. The `Skill/` workflows call it instead of the Atlassian MCP, turning schema-heavy MCP round-trips into compact TSV/text.
 
 How these fit together — and the manual habits they can't replace — is in [docs/token-optimization.md](docs/token-optimization.md).
 
@@ -30,8 +30,19 @@ Claude Code's built-in `claude mcp remove` **deletes** a server's config permane
 Requires Python 3 (pre-installed on macOS). No dependencies.
 
 ```bash
-./toolkit install        # symlink every tool into ~/.local/bin
-./toolkit doctor         # verify links, versions, PATH, agents, directives, indexes
+./bin/toolkit install    # symlink every tool into ~/.local/bin
+./bin/toolkit doctor     # verify links, versions, PATH, agents, directives, indexes
+```
+
+Layout:
+
+```
+bin/          every executable — the only thing 'toolkit install' links onto PATH
+docs/         one reference page per tool
+automation/   launchd job scripts + the agent manifests they render from
+Scripts/      helper scripts invoked by absolute path, not via PATH
+Output/       local-only work product (gitignored)
+Skill/        local-only workflow definitions (gitignored)
 ```
 
 `toolkit doctor` exists because of a real incident: the repo moved and every
@@ -335,7 +346,7 @@ $ csession journal --days 7
 **atl** — a Jira sprint query as TSV instead of an MCP JSON payload:
 
 ```
-$ Scripts/atlassian/atl sprint "Sprint 42" --mine
+$ bin/atl sprint "Sprint 42" --mine
 PROJ-101  Review       Task  A. Developer  API for visit summary service
 PROJ-102  Ready for QA Task  A. Developer  Route-level unit tests for module APIs
 # 2 issues: Ready for QA=1, Review=1

@@ -22,7 +22,7 @@
     {
       "name": "worklog",
       "description": "write the daily work log from the session index and git commits",
-      "program": ["{{REPO}}/Scripts/worklog/worklog", "check"],
+      "program": ["{{REPO}}/bin/worklog", "check"],
       "schedule": {"type": "daily", "hour": 21, "minute": 15},
       "run_at_load": true,
       "log": "{{HOME}}/.claude/code-index/logs/worklog-launchd.log",

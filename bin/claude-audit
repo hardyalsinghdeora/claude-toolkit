@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""claude-audit — measure Claude Code usage from local state.
+
+Exists because the first two editions of the usage audit were assembled by
+hand, and both were wrong in ways that changed their conclusions:
+
+  * tool calls were counted by grepping '"name":"…"', which matched Jira field
+    values (inflating) while missing calls inside content blocks (deflating).
+    The 2026-07-30 edition was ~40% low and missed the busiest MCP server on
+    the machine entirely — 359 calls that never appeared in the report.
+  * session length was reported across all transcripts, but half of them are
+    headless launchd runs. The "median session 11 min" figure that edition
+    built an argument on was an automation artefact; the interactive median
+    was 28 min.
+
+Both classes of error come from enumerating what you expect instead of
+counting what actually fired. This script does the latter: it parses
+`tool_use` content blocks, and splits interactive from automated sessions.
+
+Usage:
+  claude-audit                       whole history, text report
+  claude-audit --month 2026-07       one calendar month
+  claude-audit --prev-month          the month before today (for automation)
+  claude-audit --json                machine-readable, for a skill to narrate
+  claude-audit --config-only         skip transcripts, just config state (fast)
+
+Reads only: ~/.claude/projects/**.jsonl, ~/.claude/settings*.json,
+~/.claude.json, ~/.claude/plugins, ~/Library/LaunchAgents. Writes nothing.
+"""
+import argparse, base64, collections, datetime as dt, glob, json, os, re
+import statistics, subprocess, sys
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+THRESHOLDS = [5, 10, 15, 30, 60]
+HEADLINE = 30                     # idle threshold, minutes — the headline figure
+LOCAL = dt.datetime.now().astimezone().tzinfo
+
+# A transcript is an automated launchd run, not you, when its opening turns say
+# so. These jobs open a session, do one pass and exit; counting them alongside
+# interactive work halves the median and inflates the session count.
+AUTO_RE = re.compile(r"headless|automated[^\"]{0,40}refresh", re.I)
+
+
+# --------------------------------------------------------------- transcripts
+
+def read_sessions():
+    out = {}
+    for f in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
+        ts, tools, side, head = [], collections.Counter(), [], []
+        for i, line in enumerate(open(f, errors="ignore")):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if "isSidechain" in d:
+                side.append(bool(d["isSidechain"]))
+            if d.get("timestamp"):
+                try:
+                    ts.append(dt.datetime.fromisoformat(
+                        d["timestamp"].replace("Z", "+00:00")))
+                except Exception:
+                    pass
+            if i < 12:
+                head.append(json.dumps(d)[:2000])
+            m = d.get("message")
+            if isinstance(m, dict) and isinstance(m.get("content"), list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        tools[b.get("name", "?")] += 1
+        if not ts:
+            continue
+        ts.sort()
+        out[f] = {
+            "proj": os.path.basename(os.path.dirname(f)),
+            # subagent transcript = every flagged entry is a sidechain. Its time
+            # is nested inside the parent session and must never be added in.
+            "side": bool(side) and all(side),
+            "auto": bool(AUTO_RE.search(" ".join(head))),
+            "ts": ts,
+            "tools": tools,
+            "bytes": os.path.getsize(f),
+        }
+    return out
+
+
+def gaps(ts, thresh_min, lo=None, hi=None):
+    """Active seconds: consecutive gaps <= threshold, attributed to gap start."""
+    lim = dt.timedelta(minutes=thresh_min)
+    tot = 0.0
+    for a, b in zip(ts, ts[1:]):
+        g = b - a
+        if g > lim:
+            continue
+        if lo and a < lo:
+            continue
+        if hi and a >= hi:
+            continue
+        tot += g.total_seconds()
+    return tot / 3600
+
+
+def month_bounds(spec):
+    y, m = (int(x) for x in spec.split("-"))
+    lo = dt.datetime(y, m, 1, tzinfo=LOCAL)
+    hi = dt.datetime(y + (m == 12), (m % 12) + 1, 1, tzinfo=LOCAL)
+    return lo, hi
+
+
+# -------------------------------------------------------------- config state
+
+def config_state():
+    c = {}
+    try:
+        c["version"] = subprocess.run(["claude", "--version"], capture_output=True,
+                                      text=True, timeout=20).stdout.strip()
+    except Exception:
+        c["version"] = "unknown"
+
+    # extensibility directories Claude Code looks for
+    c["dirs"] = {d: os.path.isdir(os.path.join(HOME, ".claude", d))
+                 for d in ("skills", "agents", "commands", "hooks", "output-styles")}
+
+    # skills: authored on disk vs actually reachable
+    skdir = os.path.join(HOME, ".claude", "skills")
+    linked = {}
+    if os.path.isdir(skdir):
+        for e in sorted(os.listdir(skdir)):
+            p = os.path.join(skdir, e)
+            linked[e] = os.path.exists(p)          # False == dangling symlink
+    c["skills_linked"] = linked
+    src = os.path.join(HOME, "Workspace", "Claude", "Skill")
+    c["skills_authored"] = sorted(
+        e for e in os.listdir(src)
+        if os.path.isdir(os.path.join(src, e)) and not e.startswith("_")
+    ) if os.path.isdir(src) else []
+
+    # permissions + plaintext-secret scan
+    perms = {"allow": 0, "deny": 0, "ask": 0, "stale": 0, "broad": [], "jwt": None}
+    for fn in ("settings.json", "settings.local.json"):
+        p = os.path.join(HOME, ".claude", fn)
+        if not os.path.exists(p):
+            continue
+        try:
+            d = json.load(open(p)).get("permissions", {})
+        except Exception:
+            continue
+        for k in ("allow", "deny", "ask"):
+            perms[k] += len(d.get(k, []))
+        for r in d.get("allow", []):
+            if re.search(r"pr\d+\.diff|scratchpad/|/tmp/claude-|\.bak", r):
+                perms["stale"] += 1
+            # "allow arbitrary execution" shapes: an interpreter or fetcher
+            # whose whole argument list is a wildcard (incl. `npm run *`).
+            if re.match(r"^Bash\((python3?|node|npm|npx|bash|sh|zsh|curl|wget|chmod)"
+                        r"( \w+)? \*\)$", r):
+                perms["broad"].append(r)
+            m = re.search(r"eyJ[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.", r)
+            if m and not perms["jwt"]:
+                pad = m.group(1) + "=" * (-len(m.group(1)) % 4)
+                try:
+                    pl = json.loads(base64.urlsafe_b64decode(pad))
+                    exp = dt.datetime.fromtimestamp(pl["exp"])
+                    perms["jwt"] = {"file": fn, "exp": exp.strftime("%Y-%m-%d"),
+                                    "valid": exp > dt.datetime.now()}
+                except Exception:
+                    perms["jwt"] = {"file": fn, "exp": "undecodable", "valid": None}
+    c["permissions"] = perms
+
+    # MCP servers declared at user scope
+    try:
+        j = json.load(open(os.path.join(HOME, ".claude.json")))
+        c["mcp_servers"] = {n: (s.get("url") or s.get("command") or "?")
+                            for n, s in (j.get("mcpServers") or {}).items()}
+        c["plugins_enabled"] = j.get("enabledPlugins") or {}
+    except Exception:
+        c["mcp_servers"], c["plugins_enabled"] = {}, {}
+
+    mk = os.path.join(HOME, ".claude", "plugins", "marketplaces")
+    c["plugins_available"] = sum(
+        len(os.listdir(os.path.join(mk, m, "plugins")))
+        for m in (os.listdir(mk) if os.path.isdir(mk) else [])
+        if os.path.isdir(os.path.join(mk, m, "plugins")))
+
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True,
+                             text=True, timeout=20).stdout
+        c["launchd"] = sorted(l.split("\t")[-1] for l in out.splitlines()
+                              if "com.hardyal" in l)
+    except Exception:
+        c["launchd"] = []
+
+    mem = os.path.join(HOME, ".claude", "projects", "-Users-hardyal-deora", "memory")
+    c["memory"] = len([f for f in os.listdir(mem)
+                       if f.endswith(".md") and f != "MEMORY.md"]) \
+        if os.path.isdir(mem) else 0
+    return c
+
+
+# ------------------------------------------------------------------ assemble
+
+def build(month=None):
+    S = read_sessions()
+    lo = hi = None
+    label = "all history"
+    if month:
+        lo, hi = month_bounds(month)
+        label = lo.strftime("%B %Y")
+        S = {f: v for f, v in S.items()
+             if any(lo <= t.astimezone(LOCAL) < hi for t in v["ts"])}
+
+    top = {f: v for f, v in S.items() if not v["side"]}
+    sub = {f: v for f, v in S.items() if v["side"]}
+    if not top:
+        return {"label": label, "empty": True}
+
+    H = {f: gaps(v["ts"], HEADLINE, lo, hi) for f, v in top.items()}
+    total = sum(H.values())
+    times = [t.astimezone(LOCAL) for v in S.values() for t in v["ts"]
+             if (not lo or lo <= t.astimezone(LOCAL) < hi)]
+
+    daily, hod = collections.Counter(), collections.Counter()
+    for f, v in top.items():
+        for a, b in zip(v["ts"], v["ts"][1:]):
+            g = b - a
+            if g > dt.timedelta(minutes=HEADLINE):
+                continue
+            al = a.astimezone(LOCAL)
+            if lo and not (lo <= al < hi):
+                continue
+            daily[al.date()] += g.total_seconds() / 3600
+            hod[al.hour] += g.total_seconds() / 3600
+
+    split = {}
+    for kind, sel in (("interactive", lambda v: not v["auto"]),
+                      ("automated", lambda v: v["auto"])):
+        g = {f: H[f] for f, v in top.items() if sel(v)}
+        mins = sorted(h * 60 for h in g.values()) or [0]
+        split[kind] = {"sessions": len(g), "hours": round(sum(g.values()), 1),
+                       "median_min": round(statistics.median(mins), 1)}
+
+    tools = collections.Counter()
+    for v in S.values():
+        tools.update(v["tools"])
+    mcp = collections.Counter()
+    for t, n in tools.items():
+        if t.startswith("mcp__"):
+            mcp[t.split("__")[1]] += n
+
+    skill_calls = collections.Counter()
+    for f, v in S.items():
+        for t, n in v["tools"].items():
+            if t == "Skill":
+                skill_calls["Skill"] += n
+
+    span = (max(times).date() - min(times).date()).days + 1 if times else 0
+    return {
+        "label": label,
+        "generated": dt.datetime.now(LOCAL).strftime("%Y-%m-%d %H:%M"),
+        "transcripts": {"total": len(S), "top": len(top), "sub": len(sub),
+                        "mb": round(sum(v["bytes"] for v in S.values()) / 1e6)},
+        "range": [min(times).strftime("%Y-%m-%d"), max(times).strftime("%Y-%m-%d")],
+        "hours": {str(t): round(sum(gaps(v["ts"], t, lo, hi) for v in top.values()), 1)
+                  for t in THRESHOLDS},
+        "headline_hours": round(total, 1),
+        "subagent_hours": round(sum(gaps(v["ts"], HEADLINE, lo, hi)
+                                    for v in sub.values()), 1),
+        "wallclock_hours": round(sum((v["ts"][-1] - v["ts"][0]).total_seconds()
+                                     for v in top.values()) / 3600, 1),
+        "active_days": len(daily), "span_days": span,
+        "per_active_day": round(total / max(len(daily), 1), 1),
+        "longest_session_h": round(max(H.values()), 1),
+        "split": split,
+        "projects": {p: round(h, 1) for p, h in
+                     sorted(collections.Counter(
+                         {p: sum(H[f] for f in top if top[f]["proj"] == p)
+                          for p in {v["proj"] for v in top.values()}}
+                     ).items(), key=lambda kv: -kv[1])},
+        "daily": {str(d): round(h, 1) for d, h in sorted(daily.items())},
+        "weekday": {w: round(sum(h for d, h in daily.items()
+                                 if d.strftime("%a") == w), 1)
+                    for w in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]},
+        "hour_of_day": {f"{h:02d}": round(hod.get(h, 0), 1) for h in range(24)
+                        if hod.get(h, 0) > 0.05},
+        "tools": dict(tools.most_common()),
+        "tool_total": sum(tools.values()),
+        "mcp": dict(mcp.most_common()),
+        "config": config_state(),
+    }
+
+
+# -------------------------------------------------------------------- output
+
+def text(r):
+    if r.get("empty"):
+        return f"no transcripts in {r['label']}"
+    o, t = [], r["transcripts"]
+    p = o.append
+    p(f"# claude-audit — {r['label']}   (generated {r['generated']})\n")
+    p(f"transcripts      {t['total']} ({t['mb']} MB) = {t['top']} top-level + {t['sub']} subagent")
+    p(f"range            {r['range'][0]} -> {r['range'][1]}  ({r['span_days']} days)")
+    p(f"active hours     {r['headline_hours']} h over {r['active_days']} active days"
+      f"  ({r['per_active_day']} h/day)")
+    p(f"subagent hours   {r['subagent_hours']} h  (nested, NOT additive)")
+    p(f"wall-clock       {r['wallclock_hours']} h  (sessions left open, not work)")
+    p(f"longest session  {r['longest_session_h']} h")
+    p("\n-- idle-threshold sensitivity --")
+    for k, v in r["hours"].items():
+        p(f"  {k:>3} min  {v:7.1f} h" + ("   <== headline" if int(k) == HEADLINE else ""))
+    p("\n-- interactive vs automated --")
+    for k, v in r["split"].items():
+        p(f"  {k:<12} sessions={v['sessions']:>4}  hours={v['hours']:6.1f}"
+          f"  median={v['median_min']:>5.1f} min")
+    p("\n-- hours by project --")
+    for k, v in r["projects"].items():
+        p(f"  {v:6.1f} h  {100*v/max(r['headline_hours'],.01):5.1f}%  {k}")
+    p("\n-- daily --")
+    for k, v in r["daily"].items():
+        p(f"  {k}  {v:5.1f}")
+    p("\n-- weekday --  " + " · ".join(f"{k} {v}" for k, v in r["weekday"].items()))
+    p("\n-- hour of day (local) --")
+    for k, v in r["hour_of_day"].items():
+        p(f"  {k}:00  {'#'*int(v*2):<26} {v:5.1f}")
+    p(f"\n-- tool calls: {r['tool_total']} total (from tool_use blocks) --")
+    for k, v in list(r["tools"].items())[:40]:
+        p(f"  {v:>6}  {k}")
+    p("\n-- MCP by server --")
+    for k, v in r["mcp"].items():
+        p(f"  {v:>6}  {k}")
+
+    c = r["config"]
+    p(f"\n-- config state --")
+    p(f"  version          {c['version']}")
+    p(f"  missing dirs     {', '.join(k for k, ok in c['dirs'].items() if not ok) or 'none'}")
+    ok = sum(1 for v in c["skills_linked"].values() if v)
+    p(f"  skills           {len(c['skills_authored'])} authored, {ok} linked & resolving")
+    unl = [s for s in c["skills_authored"] if s not in c["skills_linked"]]
+    if unl:
+        p(f"    unlinked       {', '.join(unl)}")
+    dang = [s for s, v in c["skills_linked"].items() if not v]
+    if dang:
+        p(f"    DANGLING       {', '.join(dang)}")
+    pm = c["permissions"]
+    p(f"  permissions      allow={pm['allow']} deny={pm['deny']} ask={pm['ask']}"
+      f"  stale={pm['stale']}")
+    if pm["broad"]:
+        p(f"    broad exec     {', '.join(pm['broad'])}")
+    if pm["jwt"]:
+        p(f"    PLAINTEXT JWT  {pm['jwt']['file']} exp={pm['jwt']['exp']} valid={pm['jwt']['valid']}")
+    p(f"  mcp servers      {', '.join(c['mcp_servers']) or 'none'}")
+    p(f"  plugins          {c['plugins_available']} available, {len(c['plugins_enabled'])} enabled")
+    p(f"  launchd          {', '.join(c['launchd']) or 'none'}")
+    p(f"  memory entries   {c['memory']}")
+    return "\n".join(o)
+
+
+VERSION = "1.0.0"
+
+
+def main():
+    # `toolkit doctor` probes every tool with --version and fails it if that
+    # exits non-zero, so this is a contract, not a nicety.
+    if "--version" in sys.argv[1:] or "version" in sys.argv[1:2]:
+        print(f"claude-audit {VERSION}")
+        return
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="store_true", help="print version and exit")
+    ap.add_argument("--month", help="YYYY-MM — scope to one calendar month")
+    ap.add_argument("--prev-month", action="store_true",
+                    help="scope to the month before today")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--config-only", action="store_true",
+                    help="skip transcript parsing (fast)")
+    a = ap.parse_args()
+
+    if a.config_only:
+        c = config_state()
+        print(json.dumps(c, indent=2) if a.json else
+              "\n".join(f"{k:<18} {v}" for k, v in c.items()))
+        return
+
+    month = a.month
+    if a.prev_month:
+        f = dt.date.today().replace(day=1) - dt.timedelta(days=1)
+        month = f.strftime("%Y-%m")
+    if month and not re.match(r"^\d{4}-\d{2}$", month):
+        sys.exit("--month expects YYYY-MM")
+
+    r = build(month)
+    print(json.dumps(r, indent=2, default=str) if a.json else text(r))
+
+
+if __name__ == "__main__":
+    main()

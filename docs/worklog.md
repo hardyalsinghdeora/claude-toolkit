@@ -1,6 +1,6 @@
 # worklog — zero-token daily work logs
 
-**Version 1.0.0** · `Scripts/worklog/worklog`
+**Version 1.0.0** · `bin/worklog`
 
 Builds a per-day summary of what was actually worked on from two purely local sources — the `csession` session index and git commits across `~/Workspace` repos — and writes it to `Output/worklog/<YYYY-MM-DD>.md`.
 

@@ -1,6 +1,6 @@
 # atl — offline Jira/Confluence fetcher
 
-**Version 1.2.0** · `Scripts/atlassian/atl`
+**Version 1.2.0** · `bin/atl`
 
 Direct REST calls to Jira and Confluence with **compact output**, replacing Atlassian MCP round-trips (tool-schema loading plus verbose JSON) for the handful of queries that actually come up.
 

@@ -12,7 +12,7 @@ Only `Skill/README.md` and `Skill/_example/SKILL.md` are in git. **Real skills a
 
 ## The four conventions
 
-1. **Offline-first data fetch.** Any skill needing Jira, Confluence or database data calls a local script — `Scripts/atlassian/atl`, `db-conn`, `dbindex` — before considering MCP. Compact TSV or plain text costs a fraction of the equivalent MCP JSON, and works without a VPN.
+1. **Offline-first data fetch.** Any skill needing Jira, Confluence or database data calls a local script — `bin/atl`, `db-conn`, `dbindex` — before considering MCP. Compact TSV or plain text costs a fraction of the equivalent MCP JSON, and works without a VPN.
 2. **Dry-run by default.** Skills write to `Output/` and never post, mail or comment externally without an explicit instruction in the moment. A workflow that can publish is a workflow that will eventually publish something unintended.
 3. **Credentials via `claude-vault` only.** No token or password ever appears in a `SKILL.md`, a helper script, or an output file.
 4. **Keyed outputs.** Files are named by stable ids (`Output/Review/<repo>/<pr>.md`) so a re-run overwrites rather than accumulating near-duplicates.

@@ -15,7 +15,11 @@ Skill/
 │   ├── SKILL.md           #        → Output/Standards-Review/<repo>/<pr>.md
 │   └── references/standards-digest.md
 ├── sprint-retro/SKILL.md # local: my sprint retrospective → Output/Retro/
-├── sprint-briefing/…     # local: squad monthly briefing → Output/Report/
+├── monthly-briefing/…    # local: squad monthly briefing + retro rollup
+│                        #        → Output/Monthly-Report/<Month>-<YYYY>.md
+├── usage-audit/…         # local: monthly Claude Code usage & coverage audit
+│                        #        → Output/usage/<Month>-<YYYY>.md; measurement
+│                        #        in bin/claude-audit, run by launchd monthly
 ├── build-release-email/… # local: release mail from a Jira version URL
 ├── jira-ticket/…         # local: create a ticket (preview → confirm → create)
 └── vault/…               # local: store/use secrets via claude-vault
@@ -24,7 +28,7 @@ Skill/
 ## Conventions these skills follow
 
 1. **Offline-first data fetch** — every skill that needs Jira/Confluence/DB
-   data calls a local script (`Scripts/atlassian/atl`, `db-conn`, `dbindex`)
+   data calls a local script (`bin/atl`, `db-conn`, `dbindex`)
    before falling back to MCP. Scripts return compact TSV/plain text, which
    costs a fraction of the tokens of MCP JSON.
 2. **Dry-run by default** — skills write to `Output/` and never post, mail, or

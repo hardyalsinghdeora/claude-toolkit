@@ -10,6 +10,11 @@
 # task-specific work products (reviews, reports, dashboards, SQL dumps)
 Output/
 
+# Brain/ is deliberately NOT ignored. It is the AI knowledge base — being
+# searchable is its entire purpose, and cindex has no --root flag, so excluding
+# it here would make it unreachable. It stays out of git via .gitignore; this
+# file only controls what AI search can see.
+
 # personal workflow definitions
 Skill/
 
@@ -21,6 +26,11 @@ logs/
 .env
 *.env
 
+# build/interpreter artefacts
+__pycache__/
+*.pyc
+
 # archives & OS noise
 *.zip
+*.bak
 .DS_Store

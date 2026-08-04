@@ -12,8 +12,8 @@ Use the local fetcher; fall back to MCP only if it fails, and if credentials
 are missing give the user the setup line from `atl --help`.
 
 ```bash
-Scripts/atlassian/atl jql 'project = PROJ AND updated >= -7d ORDER BY status ASC'
-Scripts/atlassian/atl page <status-confluence-page-url>   # optional context
+bin/atl jql 'project = PROJ AND updated >= -7d ORDER BY status ASC'
+bin/atl page <status-confluence-page-url>   # optional context
 ```
 
 ## Inputs

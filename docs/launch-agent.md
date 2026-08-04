@@ -7,11 +7,22 @@ macOS-native way to run toolkit jobs **whenever the laptop is on**, independent 
 | Label | Runs | Schedule | Log |
 |---|---|---|---|
 | `com.<you>.cindex-refresh` | `automation/cindex-refresh.sh` | daily 09:00 + at load | `~/.claude/code-index/logs/launchd.log` |
-| `com.<you>.worklog` | `Scripts/worklog/worklog check` | daily 21:15 + at load | `~/.claude/code-index/logs/worklog-launchd.log` |
+| `com.<you>.worklog` | `bin/worklog check` | daily 21:15 + at load | `~/.claude/code-index/logs/worklog-launchd.log` |
 
 Both are local-only and cost no tokens — an mtime-incremental index sweep and a work-log rollup. Agents that run a headless `claude -p` session per tick are possible but **bill on every tick**; treat that as a deliberate choice, bound the schedule tightly, and read the watchdog note under Gotchas first.
 
 The plists live in `~/Library/LaunchAgents/`, rendered from `automation/launchd/agents.json` by `toolkit agents install` — that manifest, not the plist, is the source of truth.
+
+Jobs that are specific to one machine or workplace go in `automation/launchd/agents.local.json` instead, which is gitignored and layered on top of the tracked manifest (same name in both → the local entry wins). `toolkit agents install` reads both, so a local-only job is managed exactly like a tracked one without ever being staged. Four schedule types:
+
+```json
+{"type": "daily",    "hour": 9,  "minute": 0}
+{"type": "hourly",   "from": 9,  "to": 18, "minute": 0}
+{"type": "window",   "from": 9,  "to": 18, "every_minutes": 30}
+{"type": "interval", "seconds": 1800}
+```
+
+`window` is the bounded-cadence one: `to` **closes** the window rather than adding another hour of ticks, so `9-18` every 30m is 09:00 … 18:00 — nineteen ticks, not twenty. `interval` has no such bound; it fires round the clock, which is rarely what you want for a job that costs anything.
 
 ## How it works
 
@@ -33,7 +44,7 @@ The plists live in `~/Library/LaunchAgents/`, rendered from `automation/launchd/
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/YOU/Workspace/Claude-toolkit/automation/myjob.sh</string>
+    <string>/Users/YOU/Workspace/Claude/automation/myjob.sh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -67,8 +78,8 @@ toolkit agents run worklog                # fire one tick now
 toolkit agents stop worklog               # kill the running tick, keep the schedule
 toolkit agents pause worklog --reason "…" --until 18:00
 toolkit agents resume worklog
-toolkit agents every worklog 'hourly 9-18'
-toolkit agents install [--dry-run]        # render plists from automation/launchd/agents.json
+toolkit agents every worklog 'hourly 9-18'   # also 'daily 09:00', '30m 9-18', '30m'
+toolkit agents install [--dry-run]        # render plists from agents.json + agents.local.json
 ```
 
 See `toolkit.md`. The rest of this section is the underlying `launchctl` reference — what the wrapper runs, and what to use for an agent the toolkit does not manage.

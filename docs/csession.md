@@ -46,7 +46,7 @@ Options: `--limit N` (25), `--project <substr>`, `--json`.
 ## Gotchas
 
 - **`prune --apply` is destructive** — it removes sessions from resume history. Run it without `--apply` first, always.
-- **Project paths are decoded from directory names**, and Claude's encoding replaces both `/` and `.` with `-`, which is lossy: `Claude-toolkit` decodes as `Claude/toolkit`. The `$HOME` prefix is recovered correctly; path segments containing hyphens or dots may not be.
+- **Project paths are decoded from directory names**, and Claude's encoding replaces both `/` and `.` with `-`, which is lossy: `Claude` decodes as `Claude/toolkit`. The `$HOME` prefix is recovered correctly; path segments containing hyphens or dots may not be.
 - **Only indexed transcripts are searchable.** Sessions from before the index was built are picked up on the next `build`/incremental pass, but transcripts deleted outside the tool are simply gone.
 - **The journal reflects session activity, not commits.** For a commit-aware view of the same days, see `worklog`, which combines both.
 
