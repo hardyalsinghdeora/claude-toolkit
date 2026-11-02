@@ -34,6 +34,12 @@ Requires Python 3 (pre-installed on macOS). No dependencies.
 ./bin/toolkit doctor     # verify links, versions, PATH, agents, directives, indexes
 ```
 
+On Windows run the same commands with `python bin/toolkit ...`. Instead of symlinks,
+`install` writes two launchers per tool into the bin dir: `<tool>.cmd` (cmd/PowerShell)
+and an extensionless `<tool>` for Git Bash. squeeze, cindex, csession and the other
+pure-Python tools work there; the Keychain and launchd parts (claude-vault, db-conn's
+credentials, `toolkit agents`) are macOS only.
+
 Layout:
 
 ```

@@ -13,8 +13,9 @@
 #   - prints a savings report to stderr (bytes + estimated tokens)
 #
 # JSON mode (--json): compacts whitespace, samples long arrays (first
-# --json-items, then "+N more"), truncates long strings. Falls back to text
-# mode if the input is not valid JSON.
+# --json-items, then "+N more"), truncates long strings. JSONL input (one
+# object per line) is compacted per line, then elided like text. Falls back
+# to text mode if the input is not valid JSON.
 #
 # Usage:
 #   <command> | squeeze [options]          # pipe mode
@@ -45,9 +46,11 @@ import re
 import subprocess
 import sys
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
-DEFAULT_KEEP = r"(?i)\b(error|fatal|fail(ed|ure)?s?|exception|traceback|panic|warn(ing)?|denied|refused|timed?[ -]?out|not found)\b"
+DEFAULT_KEEP = r"(?i)\b(errors?|fatal|fail(ed|ure)?s?|exceptions?|traceback|panic(ked)?|warn(ing)?s?|denied|refused|timed?[ -]?out|not found)\b"
+
+ELIDED_RE = re.compile(r"··· ([\d,]+) lines elided")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\r(?!\n)")
 
@@ -99,13 +102,21 @@ def elide(lines, head_n, tail_n, keep_re, keep_max):
     return head + [marker] + kept + tail
 
 
+def nbytes(text):
+    return len(text.encode("utf-8"))
+
+
 def byte_cap(text, max_bytes):
-    if len(text) <= max_bytes:
+    """Cap at max_bytes of UTF-8, not characters — non-ASCII text would
+    otherwise run up to 4x over. Cuts are snapped to character boundaries."""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
         return text
     head = int(max_bytes * 0.6)
     tail = max_bytes - head
-    return (text[:head] + f"\n··· {len(text) - max_bytes:,} bytes elided ···\n"
-            + text[-tail:])
+    return (raw[:head].decode("utf-8", "ignore")
+            + f"\n··· {len(raw) - max_bytes:,} bytes elided ···\n"
+            + raw[-tail:].decode("utf-8", "ignore"))
 
 
 def squeeze_text(text, args):
@@ -140,10 +151,58 @@ def looks_json(text):
         return False
 
 
+def looks_jsonl(text):
+    """Two or more non-blank lines, every one a JSON object or array."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    return all(l.lstrip()[:1] in ("{", "[") and looks_json(l) for l in lines)
+
+
+def squeeze_jsonl(text, args):
+    # trim each record like --json, then elide the stream like text
+    lines = [json.dumps(trim_json(json.loads(l), args.json_items),
+                        separators=(",", ":"), ensure_ascii=False, default=str)
+             for l in text.splitlines() if l.strip()]
+    keep_re = re.compile(args.keep) if args.keep else None
+    head_n = args.head if args.head is not None else int(args.max_lines * 0.6)
+    tail_n = args.tail if args.tail is not None else args.max_lines - head_n
+    lines = elide(lines, head_n, tail_n, keep_re, args.keep_max)
+    return line_cap(lines, args.max_bytes)
+
+
+def line_cap(lines, max_bytes):
+    """byte_cap that drops whole lines, so every surviving JSONL record still
+    parses. Falls back to byte_cap if even one line is over budget."""
+    text = "\n".join(lines)
+    if nbytes(text) <= max_bytes:
+        return text
+    def take(seq, budget):
+        out, used = [], 0
+        for line in seq:
+            used += nbytes(line) + 1
+            if used > budget:
+                break
+            out.append(line)
+        return out
+    head = take(lines, int(max_bytes * 0.6))
+    tail = take(reversed(lines[len(head):]), max_bytes - int(max_bytes * 0.6))[::-1]
+    if not head and not tail:
+        return byte_cap(text, max_bytes)
+    # a dropped elide() marker stands for many lines — count those, not 1
+    dropped = 0
+    for line in lines[len(head):len(lines) - len(tail)]:
+        m = ELIDED_RE.match(line)
+        dropped += int(m.group(1).replace(",", "")) if m else 1
+    return "\n".join(head + [f"··· {dropped:,} lines elided ···"] + tail)
+
+
 def squeeze_json(text, args):
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
+        if looks_jsonl(text):
+            return squeeze_jsonl(text, args)
         print("squeeze: input is not valid JSON, using text mode", file=sys.stderr)
         return squeeze_text(text, args)
     out = json.dumps(trim_json(data, args.json_items), separators=(",", ":"),
@@ -152,7 +211,7 @@ def squeeze_json(text, args):
 
 
 def tokens(n_bytes):
-    return n_bytes / 4  # rough heuristic: ~4 chars per token
+    return n_bytes / 4  # rough heuristic: ~4 bytes per token
 
 
 def fmt_tokens(n_bytes):
@@ -161,6 +220,11 @@ def fmt_tokens(n_bytes):
 
 
 def main():
+    # Windows pipes default to a legacy codepage that cannot encode the ··· / …
+    # markers; force UTF-8 so output never dies mid-write.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(
         prog="squeeze", add_help=True,
         description="Compress verbose command output to save tokens in AI sessions.")
@@ -197,16 +261,22 @@ def main():
 
     # Q1: sniff JSON so --json is not required for obvious payloads
     sniff = raw.lstrip()[:1]
-    is_json = args.json or (sniff in "{[" and len(raw) > 200 and looks_json(raw))
-    out = squeeze_json(raw, args) if is_json else squeeze_text(raw, args)
+    big = sniff and sniff in "{[" and len(raw) > 200
+    if args.json or (big and looks_json(raw)):
+        out = squeeze_json(raw, args)
+    elif big and looks_jsonl(raw):
+        out = squeeze_jsonl(raw, args)
+    else:
+        out = squeeze_text(raw, args)
     sys.stdout.write(out)
     if out and not out.endswith("\n"):
         sys.stdout.write("\n")
 
     if not args.quiet:
-        saved = 100 * (1 - len(out) / len(raw)) if raw else 0
-        print(f"squeeze: {len(raw):,} → {len(out):,} bytes "
-              f"(≈{fmt_tokens(len(raw))} → ≈{fmt_tokens(len(out))} tokens, "
+        n_in, n_out = nbytes(raw), nbytes(out)
+        saved = 100 * (1 - n_out / n_in) if n_in else 0
+        print(f"squeeze: {n_in:,} → {n_out:,} bytes "
+              f"(≈{fmt_tokens(n_in)} → ≈{fmt_tokens(n_out)} tokens, "
               f"{saved:.0f}% saved)", file=sys.stderr)
     return code
 

@@ -14,6 +14,7 @@ The repo moved from `~/Desktop` to `~/Workspace` and every `~/.local/bin` symlin
 
 ```sh
 toolkit install [--bin DIR]   # (re)link every tool into ~/.local/bin
+                              #   (Windows: writes .cmd + Git Bash shims instead)
 toolkit doctor                # verify the whole install
 toolkit list                  # the tools this repo provides
 toolkit agents <verb>         # control the launchd jobs — see below
@@ -94,6 +95,12 @@ PATH: contains /Users/<you>/.local/bin
 ## Design decisions worth knowing
 
 **Install is idempotent.** Already-correct symlinks are reported and skipped; wrong ones are replaced; the source file gets its executable bit set. Running it twice is safe and running it after any repo move is the fix.
+
+**Windows gets shims, not symlinks.** Symlinks need admin or Developer Mode there, and
+neither cmd nor PowerShell honours a shebang. So each tool gets `<tool>.cmd` and an
+extensionless sh launcher for Git Bash, both exec'ing the interpreter named by the
+script's shebang (this Python, or bash). `doctor` flags a shim whose contents no longer
+match — e.g. after a repo move or a Python upgrade — as stale.
 
 **Doctor reports, it does not repair.** Each failure line names the command that would fix it (`run 'toolkit install'`, `claude-toggle <name> refresh`, `launchctl bootstrap ...`). Automatic repair of a launchd agent or a directive block is a bigger action than a health check should take on its own.
 
