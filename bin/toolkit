@@ -8,6 +8,7 @@
 #
 # Usage:
 #   toolkit install [--bin DIR]   # (re)link every tool into ~/.local/bin
+#                                 #   (Windows: writes .cmd + Git Bash shims instead)
 #   toolkit doctor                # verify links, versions, PATH, launchd agents,
 #                                 #   directive freshness, indexes, vault health
 #   toolkit list                  # the tools this repo provides
@@ -19,6 +20,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -72,8 +74,61 @@ def cmd_list():
         print(f"{name.ljust(14)}  {rel.ljust(24)}  {'present' if p.exists() else 'MISSING'}")
 
 
+WINDOWS = os.name == "nt"
+
+
+def on_path(bin_dir):
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    if WINDOWS:  # case-insensitive filesystem
+        return str(bin_dir).lower() in (e.lower() for e in entries)
+    return str(bin_dir) in entries
+
+
+def shims(name, src):
+    """Windows can't exec a shebang script and symlinks need admin, so each
+    tool gets two small launchers: name.cmd (cmd/PowerShell) and an
+    extensionless sh script (Git Bash, which Claude Code's Bash tool uses).
+    The interpreter follows the script's shebang: python3 or bash."""
+    interp = shim_command(name, src)[0]
+    return {
+        f"{name}.cmd": f'@"{interp}" "{src}" %*\r\n',
+        name: f'#!/bin/sh\nexec "{interp.as_posix()}" "{src.as_posix()}" "$@"\n',
+    }
+
+
+def shim_command(name, src):
+    """argv the shims exec — doctor runs this to check the tool works."""
+    with open(src, encoding="utf-8", errors="replace") as f:
+        shebang = f.readline()
+    if "python" in shebang:
+        interp = Path(sys.executable)
+    else:
+        interp = Path(shutil.which("bash") or "bash")
+    return [interp, src]
+
+
+def install_windows(bin_dir):
+    for name, rel in TOOLS.items():
+        src = REPO / rel
+        if not src.exists():
+            print(f"{name}: SKIPPED — {rel} not found in the repo")
+            continue
+        for fname, body in shims(name, src).items():
+            dest = bin_dir / fname
+            if dest.exists() and dest.read_bytes() == body.encode():
+                continue
+            dest.write_text(body, encoding="utf-8", newline="")
+        print(f"{name}: shims -> {src}")
+    if not on_path(bin_dir):
+        print(f"\nnote: {bin_dir} is not on your PATH — add it in PowerShell:\n"
+              f'  [Environment]::SetEnvironmentVariable("Path", '
+              f'"{bin_dir};" + [Environment]::GetEnvironmentVariable("Path","User"), "User")')
+
+
 def cmd_install(bin_dir):
     bin_dir.mkdir(parents=True, exist_ok=True)
+    if WINDOWS:
+        return install_windows(bin_dir)
     for name, rel in TOOLS.items():
         src = REPO / rel
         if not src.exists():
@@ -88,7 +143,7 @@ def cmd_install(bin_dir):
             dest.unlink()
         dest.symlink_to(src)
         print(f"{name}: linked -> {src}")
-    if str(bin_dir) not in os.environ.get("PATH", "").split(":"):
+    if not on_path(bin_dir):
         print(f"\nnote: {bin_dir} is not on your PATH — add to ~/.zshrc:\n"
               f'  export PATH="{bin_dir}:$PATH"')
 
@@ -101,18 +156,28 @@ def check_tools(bin_dir):
         if not src.exists():
             rows.append((BAD, name, f"{rel} missing from the repo")); bad += 1
             continue
-        if not dest.exists() and not dest.is_symlink():
-            rows.append((BAD, name, f"not installed in {bin_dir} — run 'toolkit install'")); bad += 1
-            continue
-        if dest.is_symlink() and not dest.resolve().exists():
-            rows.append((BAD, name, f"broken symlink -> {os.readlink(dest)} — run 'toolkit install'")); bad += 1
-            continue
-        if dest.is_symlink() and dest.resolve() != src.resolve():
-            rows.append((WARN, name, f"links elsewhere: {dest.resolve()}"))
-            continue
-        code, out, err = sh([str(dest), "--version"])
+        if WINDOWS:
+            missing = [f for f, body in shims(name, src).items()
+                       if not (bin_dir / f).exists()
+                       or (bin_dir / f).read_bytes() != body.encode()]
+            if missing:
+                rows.append((BAD, name, f"shim missing/stale: {', '.join(missing)} — run 'toolkit install'")); bad += 1
+                continue
+            run = [str(a) for a in shim_command(name, src)]
+        else:
+            if not dest.exists() and not dest.is_symlink():
+                rows.append((BAD, name, f"not installed in {bin_dir} — run 'toolkit install'")); bad += 1
+                continue
+            if dest.is_symlink() and not dest.resolve().exists():
+                rows.append((BAD, name, f"broken symlink -> {os.readlink(dest)} — run 'toolkit install'")); bad += 1
+                continue
+            if dest.is_symlink() and dest.resolve() != src.resolve():
+                rows.append((WARN, name, f"links elsewhere: {dest.resolve()}"))
+                continue
+            run = [str(dest)]
+        code, out, err = sh(run + ["--version"])
         if code != 0:
-            code, out, err = sh([str(dest), "version"])
+            code, out, err = sh(run + ["version"])
         ver = (out or err).splitlines()[0] if (out or err) else "?"
         if code != 0:
             rows.append((BAD, name, f"does not run: {ver[:60]}")); bad += 1
@@ -700,7 +765,7 @@ def cmd_doctor(bin_dir):
         for status, name, msg in rows:
             mark = {OK: "  ok  ", WARN: " warn ", BAD: " FAIL "}[status]
             print(f"[{mark}] {name.ljust(w)}  {msg}")
-    path_ok = str(bin_dir) in os.environ.get("PATH", "").split(":")
+    path_ok = on_path(bin_dir)
     print(f"\nPATH: {'contains' if path_ok else 'MISSING'} {bin_dir}")
     if not path_ok:
         total_bad += 1
