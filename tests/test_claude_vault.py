@@ -34,13 +34,18 @@ class FakeSecurity:
         self.vault = vault
         self.calls = []
         self.stored = {}
+        self.mangle_stdin = False  # simulate an unexpected `security -i` parse
 
     def __call__(self, argv, **kw):
         self.calls.append((list(argv), kw.get("input")))
         if argv[:2] == ["security", "-i"]:
             args = self.parse(kw["input"])
             assert args[0] == "add-generic-password", args
-            self.stored[args[args.index("-s") + 1]] = args[args.index("-w") + 1]
+            value = args[args.index("-w") + 1]
+            self.stored[args[args.index("-s") + 1]] = value + "~" if self.mangle_stdin else value
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:2] == ["security", "add-generic-password"]:  # the original argv method
+            self.stored[argv[argv.index("-s") + 1]] = argv[argv.index("-w") + 1]
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:2] == ["security", "find-generic-password"]:
             svc = argv[argv.index("-s") + 1]
@@ -109,25 +114,33 @@ class KcSetTest(unittest.TestCase):
                 self.assertEqual(parsed[parsed.index("-s") + 1], "claude-vault.entry")
                 self.assertIn("-U", parsed)
 
-    def test_newline_in_value_is_refused(self):
-        with self.assertRaises(SystemExit):
-            self.vault.kc_set("entry", "line1\nline2")
-        self.assertEqual(self.fake.calls, [])
+    def test_garbled_stdin_write_falls_back_to_the_original_method(self):
+        self.fake.mangle_stdin = True
+        with redirect_stderr(io.StringIO()) as err:
+            self.vault.kc_set("entry", "s3cr3t-value")
+        self.assertEqual(self.fake.stored["claude-vault.entry"], "s3cr3t-value")
+        self.assertIn("original method", err.getvalue())
 
-    def test_stderr_from_security_is_failure(self):
+    def test_value_with_newline_uses_the_original_method(self):
+        with redirect_stderr(io.StringIO()):
+            self.vault.kc_set("entry", "line1\nline2")
+        self.assertEqual(self.fake.stored["claude-vault.entry"], "line1\nline2")
+        self.assertFalse(any(c[0][:2] == ["security", "-i"] for c in self.fake.calls))
+
+    def test_failure_of_both_methods_exits(self):
         def failing(argv, **kw):
-            return subprocess.CompletedProcess(argv, 0, "", "SecKeychainItemCreate: denied")
-        with mock.patch.object(self.vault.subprocess, "run", failing):
+            return subprocess.CompletedProcess(argv, 1, "", "SecKeychainItemCreate: denied")
+        with mock.patch.object(self.vault.subprocess, "run", failing), redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as cm:
                 self.vault.kc_set("entry", "x")
         self.assertIn("denied", str(cm.exception))
 
-    def test_readback_mismatch_is_failure(self):
+    def test_readback_mismatch_after_fallback_exits(self):
         def mangling(argv, **kw):
-            if argv[:2] == ["security", "-i"]:
+            if argv[:2] in (["security", "-i"], ["security", "add-generic-password"]):
                 return subprocess.CompletedProcess(argv, 0, "", "")
             return subprocess.CompletedProcess(argv, 0, "mangled\n", "")
-        with mock.patch.object(self.vault.subprocess, "run", mangling):
+        with mock.patch.object(self.vault.subprocess, "run", mangling), redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 self.vault.kc_set("entry", "x")
 

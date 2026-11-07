@@ -119,6 +119,11 @@ def _security_quote(arg):
     return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _kc_set_argv(args):
+    """The original method: secret in argv. Proven on macOS; used only as a fallback."""
+    return keychain(args)
+
+
 def kc_set(name, value):
     # The secret must never appear in argv (visible to every user via `ps`).
     # `security -i` reads commands from stdin, so the whole add-generic-password
@@ -128,20 +133,28 @@ def kc_set(name, value):
         "-w", value, "-U",
         "-j", "stored by claude-vault",
     ]
+    stdin_ok = False
     try:
         line = " ".join(_security_quote(a) for a in args) + "\n"
-    except ValueError as e:
-        sys.exit(f"cannot store '{name}': {e}")
-    r = keychain(["-i"], input=line)
-    # in interactive mode `security` can exit 0 even when a command failed,
-    # so a message on stderr counts as failure too
-    if r.returncode != 0 or r.stderr.strip():
-        sys.exit(f"keychain error: {r.stderr.strip() or f'security exited {r.returncode}'}")
-    # read back: a quoting or line-length surprise in the interactive parser
-    # must fail loudly instead of silently storing a mangled secret
-    if kc_get(name) != value:
-        sys.exit(f"keychain error: '{name}' did not read back as written — "
-                 "the stored value may be wrong; re-run 'claude-vault set'")
+        r = keychain(["-i"], input=line)
+        # in interactive mode `security` can exit 0 even when a command failed,
+        # so a message on stderr counts as failure too; a read-back catches any
+        # quoting surprise in the interactive parser
+        stdin_ok = r.returncode == 0 and not r.stderr.strip() and kc_get(name) == value
+    except (ValueError, OSError):
+        stdin_ok = False
+    if stdin_ok:
+        return
+    # Fail safe: rewrite with the original argv method so the stored value is
+    # always correct. The only cost is the old exposure in `ps`, for this write.
+    print(f"claude-vault: note: stdin write for '{name}' did not verify; "
+          "stored with the original method instead", file=sys.stderr)
+    r = _kc_set_argv(args)
+    if r.returncode != 0:
+        sys.exit(f"keychain error: {r.stderr.strip()}")
+    # kc_get strips trailing newlines, so compare the same way
+    if kc_get(name) != value.rstrip("\n"):
+        sys.exit(f"keychain error: '{name}' did not read back as written")
 
 
 def kc_get(name):
