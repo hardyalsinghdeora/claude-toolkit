@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 VERSION = "1.0.0"
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]   # bin/worklog -> repo root
 OUT = REPO / "Output" / "worklog"
 SESSION_INDEX = Path.home() / ".claude" / "session-index" / "index.json"
 WORKSPACE = Path.home() / "Workspace"

@@ -51,4 +51,4 @@ launchctl kickstart -k gui/$(id -u)/com.<you>.worklog   # run one now
 
 ## Related
 
-`csession` (one of the two inputs) · `Skill/worklog` (the narrative layer) · `docs/launch-agent.md` (the schedule)
+`csession` (one of the two inputs) · `skills/worklog` (the narrative layer) · `docs/launch-agent.md` (the schedule)

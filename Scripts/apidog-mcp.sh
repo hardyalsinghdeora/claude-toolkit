@@ -15,10 +15,13 @@ if [[ -z "$PROJECT" ]]; then
   exit 1
 fi
 
-APIDOG_ACCESS_TOKEN="$(claude-vault get apidog-access-token)" || {
-  print -u2 "apidog-mcp: could not read apidog-access-token from vault"
-  exit 1
-}
-export APIDOG_ACCESS_TOKEN
+# Pinned to an exact version: this process receives the access token, so a
+# compromised future release must not be pulled in automatically. To upgrade,
+# check `npm view apidog-mcp-server version` and the changelog, then bump.
+APIDOG_MCP_VERSION="0.0.18"
 
-exec npx -y apidog-mcp-server@latest --project="$PROJECT"
+# `claude-vault exec` puts the entry into the child's environment as
+# APIDOG_ACCESS_TOKEN (derived from the entry name) without the token ever
+# passing through this shell.
+exec claude-vault exec apidog-access-token -- \
+  npx -y "apidog-mcp-server@${APIDOG_MCP_VERSION}" --project="$PROJECT"

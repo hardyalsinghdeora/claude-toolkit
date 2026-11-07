@@ -1,4 +1,4 @@
-# Skill/ — personal workflow skills (local-only)
+# skills/ — personal workflow skills (local-only)
 
 Claude Code skills that encode *how this user works*: PR review conventions,
 sprint reports, ticket creation flows, release emails. Only this README and
@@ -8,7 +8,7 @@ employer-specific process, names, and URLs.
 ## Layout
 
 ```
-Skill/
+skills/
 ├── _example/SKILL.md     # committed: generic template showing the conventions
 ├── pr-review/SKILL.md    # local: review a PR → Output/Review/<repo>/<pr>.md
 ├── standards-pr-review/   # local: house-standards 5-axis review

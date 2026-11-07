@@ -61,4 +61,4 @@ atl whoami                                      # which account the token actual
 
 ## Related
 
-`claude-vault` (tokens) · `Skill/sprint-briefing`, `Skill/build-release-email`, `Skill/jira-ticket` (skills that fetch through this tool)
+`claude-vault` (tokens) · `skills/sprint-briefing`, `skills/build-release-email`, `skills/jira-ticket` (skills that fetch through this tool)

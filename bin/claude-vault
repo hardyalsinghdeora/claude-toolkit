@@ -74,7 +74,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SERVICE_PREFIX = "claude-vault."
 INDEX = Path.home() / ".claude" / "vault-index.json"
 ACCOUNT = getpass.getuser()
@@ -105,14 +105,56 @@ def keychain(args, **kw):
     return subprocess.run(["security"] + args, capture_output=True, text=True, **kw)
 
 
+def _security_quote(arg):
+    """Quote one argument for the line parser of `security -i`.
+
+    That parser splits a line on whitespace, groups text inside double quotes,
+    and treats a backslash as "take the next character literally". Wrapping
+    every argument in double quotes and backslash-escaping backslash and
+    double quote is therefore exact. A newline would end the command line, so
+    it (and NUL / CR) is refused rather than escaped.
+    """
+    if any(c in arg for c in ("\n", "\r", "\0")):
+        raise ValueError("value contains a newline, carriage return or NUL")
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _kc_set_argv(args):
+    """The original method: secret in argv. Proven on macOS; used only as a fallback."""
+    return keychain(args)
+
+
 def kc_set(name, value):
-    r = keychain([
+    # The secret must never appear in argv (visible to every user via `ps`).
+    # `security -i` reads commands from stdin, so the whole add-generic-password
+    # line — value included — travels through a pipe instead.
+    args = [
         "add-generic-password", "-a", ACCOUNT, "-s", SERVICE_PREFIX + name,
         "-w", value, "-U",
         "-j", "stored by claude-vault",
-    ])
+    ]
+    stdin_ok = False
+    try:
+        line = " ".join(_security_quote(a) for a in args) + "\n"
+        r = keychain(["-i"], input=line)
+        # in interactive mode `security` can exit 0 even when a command failed,
+        # so a message on stderr counts as failure too; a read-back catches any
+        # quoting surprise in the interactive parser
+        stdin_ok = r.returncode == 0 and not r.stderr.strip() and kc_get(name) == value
+    except (ValueError, OSError):
+        stdin_ok = False
+    if stdin_ok:
+        return
+    # Fail safe: rewrite with the original argv method so the stored value is
+    # always correct. The only cost is the old exposure in `ps`, for this write.
+    print(f"claude-vault: note: stdin write for '{name}' did not verify; "
+          "stored with the original method instead", file=sys.stderr)
+    r = _kc_set_argv(args)
     if r.returncode != 0:
         sys.exit(f"keychain error: {r.stderr.strip()}")
+    # kc_get strips trailing newlines, so compare the same way
+    if kc_get(name) != value.rstrip("\n"):
+        sys.exit(f"keychain error: '{name}' did not read back as written")
 
 
 def kc_get(name):
@@ -368,6 +410,14 @@ def cmd_get(name, field, copy=False, clear_after=None):
     if entry_type(meta) == "password" and sys.stdout.isatty():
         sys.exit(f"'{name}' is a password-type entry — its value is never displayed.\n"
                  f"Use it inside a command: $(claude-vault get {name})   or: claude-vault get {name} --copy")
+    if not sys.stdout.isatty() and not os.environ.get("CLAUDE_VAULT_QUIET"):
+        # stdout is a pipe or file: in an AI session that is usually the tool
+        # output, i.e. the transcript. exec is the path that keeps it out.
+        print(f"claude-vault: warning: writing '{name}' to a non-terminal stdout — "
+              "if an AI session captures this output, the value lands in its transcript.\n"
+              f"  agent-safe: claude-vault exec {name} [--prefix P] -- <cmd>   "
+              "(set CLAUDE_VAULT_QUIET=1 to silence in trusted scripts)",
+              file=sys.stderr)
     print(value)
 
 
