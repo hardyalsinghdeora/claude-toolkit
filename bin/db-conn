@@ -34,7 +34,8 @@ VERSION="1.2.0"
 
 usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
 
-vault() { claude-vault get "$@"; }
+# these values are consumed inside this script, not printed — skip the pipe warning
+vault() { CLAUDE_VAULT_QUIET=1 claude-vault get "$@"; }
 
 tsv2csv() {
   python3 -c 'import csv,sys; w=csv.writer(sys.stdout); [w.writerow(r) for r in csv.reader(sys.stdin, dialect="excel-tab")]'

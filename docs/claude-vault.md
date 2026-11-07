@@ -1,12 +1,12 @@
 # claude-vault — private credential store
 
-**Version 1.4.0** · `claude-vault` · macOS only (Keychain-backed)
+**Version 1.5.0** · `claude-vault` · macOS only (Keychain-backed)
 
-Stores DB credentials, API tokens and personal config in the **macOS Keychain**, so no secret ever lands in a plaintext file, a git repo, a prompt, or a session transcript. Only an index of *names and descriptions* is kept on disk.
+Stores DB credentials, API tokens and personal config in the **macOS Keychain**, so no secret has to land in a plaintext file, a git repo or a prompt. Only an index of *names and descriptions* is kept on disk. Keeping a value out of an AI **transcript** depends on how it is read: use `exec` (below). `get` prints the value to stdout, and when an agent runs it that stdout *is* the transcript.
 
 ## Why it exists
 
-AI sessions need credentials at the moment of use — to query a database, call Jira, launch an MCP server. The alternatives are all bad: a `.env` file that gets committed eventually, a value pasted into chat that lives in the transcript forever, or a config file that syncs to a cloud backup. The vault makes "fetch it now, from the OS keystore" the path of least resistance: you tell Claude *"use `claude-vault get <name>`"* and the value never exists anywhere it can leak.
+AI sessions need credentials at the moment of use — to query a database, call Jira, launch an MCP server. The alternatives are all bad: a `.env` file that gets committed eventually, a value pasted into chat that lives in the transcript forever, or a config file that syncs to a cloud backup. The vault makes "fetch it now, from the OS keystore" the path of least resistance: you tell Claude *"use `claude-vault exec <name> -- <cmd>`"* and the value goes from the Keychain straight into the command's environment, never into the session.
 
 ## Storage
 
@@ -57,11 +57,19 @@ claude-vault completion zsh
 
 ## Design decisions worth knowing
 
-**`exec` beats `$(claude-vault get ...)`.** Command substitution puts the secret in the parent shell's memory and, depending on the command, in `ps` output. `exec` uses `os.execvpe` so the value goes straight into the child's environment — it never transits the shell or the transcript:
+**`exec` is the agent-safe path; `get` is not.** `get` writes the value to stdout. Run by an AI session, that stdout is tool output and goes into the transcript; and `$(claude-vault get ...)` puts the secret in the parent shell's memory and, when used as an argument, in `ps` output. `exec` uses `os.execvpe` so the value goes straight into the child's environment — it never transits the shell, argv or the transcript. JSON fields become `<PREFIX><FIELD>` variables (a plain entry becomes one variable named after the entry, or `--prefix` itself):
 
 ```sh
-claude-vault exec prod-db --prefix PG -- psql -h "$PGHOST" -U "$PGUSER" mydb
+claude-vault exec prod-db --prefix PG -- psql mydb      # psql reads PGHOST/PGUSER/PGPASSWORD itself
+claude-vault exec inventory-db --prefix DB_ -- \
+  sh -c 'MYSQL_PWD="$DB_PASSWORD" exec mysql -h "$DB_HOST" -u "$DB_USER" "$DB_DATABASE"'
 ```
+
+(The single quotes matter: the variables are expanded by the child `sh`, after `exec` has set them, so the password is in the environment and never in an argument.)
+
+Because of this, `get` prints a warning to **stderr** whenever stdout is not a terminal, naming the `exec` alternative. Scripts that consume the value themselves (e.g. `db-conn`) set `CLAUDE_VAULT_QUIET=1` to skip it.
+
+**`set` never puts the value in argv.** The Keychain write runs `security -i` and sends the `add-generic-password … -w <value>` command on its stdin (each argument double-quoted, `\` and `"` escaped), then reads the entry back and fails if it does not match. Values containing a newline are refused.
 
 **Team convention: shared config, per-member passwords.** A DB is one JSON entry with host/port/user and *no password*, plus one password-type entry per person:
 

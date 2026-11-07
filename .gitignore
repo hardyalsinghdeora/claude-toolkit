@@ -1,9 +1,7 @@
 # --- task-specific work products: personal/company data, never for the public repo
 # (folder READMEs and the example skill are kept as reference)
-# Brain/ is the AI knowledge base: company-confidential product specs and
-# ~1,300 fetched Confluence pages. This repo has a PUBLIC remote, so this rule
-# is the only thing keeping that content off GitHub. Do not relax it, and do
-# not 'git add -f' anything beneath it.
+# Brain/ is the local knowledge base, never commit. This repo has a PUBLIC
+# remote: do not relax this rule or 'git add -f' anything beneath it.
 Brain/
 Output/*
 !Output/README.md

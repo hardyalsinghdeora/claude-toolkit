@@ -16,7 +16,7 @@ Output/
 # file only controls what AI search can see.
 
 # personal workflow definitions
-Skill/
+skills/
 
 # usage data & logs
 logs/

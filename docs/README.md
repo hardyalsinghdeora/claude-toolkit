@@ -6,7 +6,7 @@ Per-module reference. `../README.md` is the quick-start (install + usage snippet
 
 | Doc | Module | Version | What it does |
 |---|---|---|---|
-| [claude-vault.md](claude-vault.md) | `claude-vault` | 1.4.0 | Credentials in the macOS Keychain, never in files or prompts |
+| [claude-vault.md](claude-vault.md) | `claude-vault` | 1.5.0 | Credentials in the macOS Keychain, never in files or prompts |
 | [claude-toggle.md](claude-toggle.md) | `claude-toggle` | 1.7.0 | MCP servers on/off, config profiles, CLAUDE.md directives |
 | [db-conn.md](db-conn.md) | `db-conn` | 1.2.0 | Query Postgres/MySQL using vault credentials |
 | [squeeze.md](squeeze.md) | `squeeze` | 1.1.0 | Compress verbose command output before it enters context |
@@ -16,7 +16,7 @@ Per-module reference. `../README.md` is the quick-start (install + usage snippet
 | [atl.md](atl.md) | `atl` | 1.2.0 | Offline Jira/Confluence fetcher |
 | [toolkit.md](toolkit.md) | `toolkit` | 1.1.0 | Install, health-check, and control the launchd agents |
 | [worklog.md](worklog.md) | `worklog` | 1.0.0 | Zero-token daily work logs from local sources |
-| [skills.md](skills.md) | `Skill/` | — | Repeatable workflows Claude can invoke |
+| [skills.md](skills.md) | `skills/` | — | Repeatable workflows Claude can invoke |
 
 ## Cross-cutting
 

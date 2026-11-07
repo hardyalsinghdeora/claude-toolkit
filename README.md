@@ -13,7 +13,7 @@ Small, dependency-free CLI tools that make AI coding sessions (Claude Code) safe
 - **toolkit** — one command to install every tool (`toolkit install`) and one to verify the whole setup (`toolkit doctor`: symlinks, versions, PATH, launchd agents, directive freshness, index age, vault health; non-zero exit when broken)
 - **worklog** (`bin/`) — zero-token daily work logs: auto-generated at login and 21:15 from the csession index + git commits (sessions, commits, files touched, improvement flags), backfilling the last 7 days so weekends/leave need no bookkeeping; `worklog week` aggregates for reports, and the `worklog` skill layers AI narrative and coaching on top. See `Output/worklog/README.md` for the file format.
 
-Plus `bin/atl` — an offline Jira/Confluence fetcher (JQL search, sprint issues, fix-version resolution, page-to-plain-text, accountId lookup, issue creation) authenticated via a `jira-api-token` claude-vault entry. The `Skill/` workflows call it instead of the Atlassian MCP, turning schema-heavy MCP round-trips into compact TSV/text.
+Plus `bin/atl` — an offline Jira/Confluence fetcher (JQL search, sprint issues, fix-version resolution, page-to-plain-text, accountId lookup, issue creation) authenticated via a `jira-api-token` claude-vault entry. The `skills/` workflows call it instead of the Atlassian MCP, turning schema-heavy MCP round-trips into compact TSV/text.
 
 How these fit together — and the manual habits they can't replace — is in [docs/token-optimization.md](docs/token-optimization.md).
 
@@ -46,9 +46,9 @@ Layout:
 bin/          every executable — the only thing 'toolkit install' links onto PATH
 docs/         one reference page per tool
 automation/   launchd job scripts + the agent manifests they render from
-Scripts/      helper scripts invoked by absolute path, not via PATH
+Scripts/      helper scripts invoked by absolute path, not via PATH (e.g. apidog-mcp.sh)
 Output/       local-only work product (gitignored)
-Skill/        local-only workflow definitions (gitignored)
+skills/       workflow definitions (local-only except README, _example, worklog)
 ```
 
 `toolkit doctor` exists because of a real incident: the repo moved and every
@@ -164,18 +164,22 @@ prod-postgres-db.<dbuser>.ro / .rw   optional: view-only vs update passwords
 
 Never pass the secret itself as a CLI argument — it would land in shell history and `ps` output; use the hidden prompt, `--stdin`, or `--from-clipboard`.
 
-Example — query a DB using stored credentials:
+Example — query a DB using stored credentials, with the password kept out of argv
+and out of the transcript (`exec` exports each JSON field as `DB_<FIELD>`; the single
+quotes make the child `sh` expand them, and mysql reads the password from `MYSQL_PWD`):
 
 ```bash
-mysql -h "$(claude-vault get inventory-db --field host)" \
-      -u "$(claude-vault get inventory-db --field user)" \
-      -p"$(claude-vault get inventory-db --field password)" \
-      "$(claude-vault get inventory-db --field database)" -e "SELECT ..."
+claude-vault exec inventory-db --prefix DB_ -- \
+  sh -c 'MYSQL_PWD="$DB_PASSWORD" exec mysql -h "$DB_HOST" -u "$DB_USER" "$DB_DATABASE" -e "SELECT ..."'
 ```
+
+`claude-vault get` prints the value to stdout; when an AI session runs it, that output is
+the transcript, so `get` warns on stderr whenever stdout is not a terminal. Prefer `exec`
+in agent sessions (or `db-conn`, which does this for you).
 
 In a Claude Code session, just say e.g. *"search the inventory DB for X — credentials are in claude-vault under `inventory-db`"*.
 
-Install: same as claude-toggle (`cp claude-vault ~/.local/bin/`). macOS only.
+Install: `./bin/toolkit install` (symlinks `bin/claude-vault` onto PATH). macOS only.
 
 ## db-conn — query any database via vault credentials
 
@@ -219,7 +223,7 @@ Options: `-n/--max-lines` (200), `-b/--max-bytes` (16000), `--head`/`--tail` spl
 
 To make Claude use it automatically in every session, run `claude-toggle squeeze on` — it adds a marker-delimited directive block to `~/.claude/CLAUDE.md` telling Claude to pipe verbose commands through `squeeze`. `claude-toggle squeeze off` removes exactly that block (anything else in the file is untouched), `status` shows the current state, and a backup of `CLAUDE.md` is written before every change. Applies to new sessions only.
 
-Install: same as the others (`cp squeeze ~/.local/bin/`). Pure Python 3, no dependencies, works on any platform.
+Install: `./bin/toolkit install`. Pure Python 3, no dependencies, works on any platform.
 
 ## cindex — indexed code search for token-light sessions
 
@@ -246,7 +250,7 @@ To make Claude prefer it in every session, run `claude-toggle cindex on` — sam
 
 **Automated refresh (zero tokens):** `automation/cindex-refresh.sh` + the `com.<user>.cindex-refresh` LaunchAgent run an incremental `cindex refresh` over every code folder in `~/Workspace` at login and daily at 09:00 — pure shell, no Claude session involved. Sweep log: `~/.claude/code-index/logs/cron.log`.
 
-Install: `toolkit install` (or `cp cindex ~/.local/bin/`). Pure Python 3, no dependencies.
+Install: `./bin/toolkit install`. Pure Python 3, no dependencies.
 
 ## dbindex — indexed database schemas
 
@@ -268,7 +272,7 @@ dbindex list | status | prune
 
 Re-run `dbindex build` after migrations — schemas change rarely, so there's no automatic refresh. `claude-toggle dbindex on` (enabled by default here) adds the global directive telling Claude to consult dbindex before running live schema queries.
 
-Install: `cp dbindex ~/.local/bin/` (or symlink). Pure Python 3, no dependencies.
+Install: `./bin/toolkit install`. Pure Python 3, no dependencies.
 
 ## csession — session & task management
 
@@ -292,7 +296,7 @@ csession prune --days 45          # cleanup candidates (add --apply to delete)
 
 `claude-toggle csession on` (enabled by default here) adds the global directive: when you reference past work, Claude searches the index and pulls a brief instead of asking you to re-explain — and answers "continue or new session?" with `csession suggest`.
 
-Install: `cp csession ~/.local/bin/` (or symlink). Pure Python 3, no dependencies.
+Install: `./bin/toolkit install`. Pure Python 3, no dependencies.
 
 ## Examples — what a session actually looks like
 
@@ -365,7 +369,7 @@ The tools separate **engine** (committed, generic) from **work product** (local,
 | Path | Holds | Why local-only |
 |---|---|---|
 | `Output/` | Generated reports, PR reviews, dashboards, SQL deliverables | Company/task data |
-| `Skill/` | Personal workflow skills (PR review conventions, sprint reports…) | Encodes employer-specific process |
+| `skills/*` (except README, `_example`, `worklog`) | Personal workflow skills (PR review conventions, sprint reports…) | Encodes employer-specific process |
 | `*.log`, `logs/` | Tool/automation run logs | Usage history |
 | `.env`, `*.env` | Local config | Secrets belong in `claude-vault` |
 

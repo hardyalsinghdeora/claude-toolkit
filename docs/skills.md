@@ -1,14 +1,14 @@
 # Skills — repeatable workflows
 
-`Skill/<name>/SKILL.md` · invoked in a session as `/<name>`
+`skills/<name>/SKILL.md` · invoked in a session as `/<name>`
 
 A skill is a packaged set of instructions for a recurring task: review a PR to a fixed rubric, produce a sprint retrospective, draft a release email from a Jira version, create a ticket through a preview-then-confirm flow. It encodes *how this user works* so the workflow does not have to be re-explained each time.
 
-`Skill/README.md` holds the layout and template. This page covers how skills relate to the rest of the toolkit.
+`skills/README.md` holds the layout and template. This page covers how skills relate to the rest of the toolkit.
 
 ## What is and isn't committed
 
-Only `Skill/README.md` and `Skill/_example/SKILL.md` are in git. **Real skills are gitignored** because they encode employer-specific process, project keys, people and URLs — the same category of content that had to be scrubbed out of the tools themselves (see `project-history.md`). The example is a working template implementing every convention with placeholder values.
+Only `skills/README.md` and `skills/_example/SKILL.md` are in git. **Real skills are gitignored** because they encode employer-specific process, project keys, people and URLs — the same category of content that had to be scrubbed out of the tools themselves (see `project-history.md`). The example is a working template implementing every convention with placeholder values.
 
 ## The four conventions
 
@@ -23,7 +23,7 @@ The same reason the planned GUI will: there is one implementation to debug. When
 
 ## Known problem: two homes
 
-Skills currently exist in **two places** — an older `Promt/Skills/*.md` set (MCP-first) and this newer `Skill/*/SKILL.md` set (offline-first). They have already drifted: `pr-review` and the older `Review.md` differ. Consolidating on this repo, with pointer stubs left behind, is item **K1** in `../ENHANCEMENTS.md` and the highest-priority open work in the plan.
+Skills currently exist in **two places** — an older `Promt/Skills/*.md` set (MCP-first) and this newer `skills/*/SKILL.md` set (offline-first). They have already drifted: `pr-review` and the older `Review.md` differ. Consolidating on this repo, with pointer stubs left behind, is item **K1** in `../ENHANCEMENTS.md` and the highest-priority open work in the plan.
 
 ## Gotchas
 
@@ -33,4 +33,4 @@ Skills currently exist in **two places** — an older `Promt/Skills/*.md` set (M
 
 ## Related
 
-`Skill/README.md` (layout + template) · `atl`, `db-conn`, `dbindex` (the offline fetchers) · `worklog` (a tool with a skill layered on top)
+`skills/README.md` (layout + template) · `atl`, `db-conn`, `dbindex` (the offline fetchers) · `worklog` (a tool with a skill layered on top)
